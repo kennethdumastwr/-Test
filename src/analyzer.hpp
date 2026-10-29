@@ -1,0 +1,392 @@
+#pragma once
+// Frame-window analyzer for position-based macros. No Geode includes: the game
+// side only has to run a TrialSpec and report a TrialResult.
+//
+//   Analyzer a(macro, settings);
+//   while (auto spec = a.nextTrial()) a.submit(runInGame(*spec));
+//   const Report& r = a.report();
+//
+// Flow
+//   1. REFERENCE: replay the untouched macro from tick 0 and record the player
+//      x at every tick plus the tick each input fired on.
+//   2. For every input group: for offset d, take the x the player had at tick
+//      (T + d) in the reference, move the group to that x, replay from tick 0,
+//      PASS if the player survives until a fixed end tick.
+//   3. WindowSearch decides which offsets to try and builds [lo, hi].
+
+#include <algorithm>
+#include <climits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "macro.hpp"
+#include "window.hpp"
+
+namespace fw {
+
+struct AnalyzerSettings {
+    int radius = 8;             // max ticks scanned each side
+    bool thorough = false;
+    int probeBeyond = 1;
+    bool verify = true;
+    int horizonGroups = 2;      // survive until this many following inputs (same player) fired...
+    int horizonMinTicks = 120;  // ...and at least this many ticks after the tested input
+    bool horizonToEnd = false;  // survive to the end of the reference run
+    double epsilon = 0.001;     // x tolerance used by playback
+    int onlyAction = 0;         // 1-based action number, 0 = every input
+    int maxRunTicks = 240 * 180;  // hard stop for one run
+};
+
+struct TrialSpec {
+    std::vector<MacroAction> actions;  // sorted by x; `id` identifies the original action
+    int endTick = -1;                  // run until this tick index has been executed (-1 = no limit)
+    int stopAfterLastFire = -1;        // reference: stop N ticks after the last input fired (-1 = off)
+    int maxTick = 0;                   // safety stop
+    bool recordX = false;              // record the pre-step x of every tick
+};
+
+struct TrialResult {
+    bool died = false;
+    int deathTick = -1;       // tick index during which the player died
+    double deathX = 0.0;
+    bool completed = false;   // level finished
+    bool timedOut = false;    // hit maxTick
+    bool aborted = false;     // cancelled / unexpected reset: result is meaningless
+    int ticksRun = 0;         // number of ticks executed (tick indices 0..ticksRun-1)
+    std::vector<int> firedTick;  // per position in TrialSpec::actions, -1 = never fired
+    std::vector<double> xs;      // only if recordX: xs[t] = x before tick t
+};
+
+enum class GroupState { NotSelected, Analyzed, Redundant, Unreached, Unmappable };
+
+struct GroupReport {
+    int group = 0;
+    int player = 0;
+    double x = 0.0;
+    GroupKind kind = GroupKind::NoOp;
+    int number = 0;      // 1-based number of the first action
+    int actionCount = 0;
+    GroupState state = GroupState::NotSelected;
+    int refTick = -1;
+    int endTick = -1;
+    bool horizonCapped = false;
+    WindowResult w;
+};
+
+struct Report {
+    std::vector<GroupReport> groups;
+    bool referenceRan = false;
+    int refTicks = 0;
+    bool refDied = false;
+    int refDeathTick = -1;
+    double refDeathX = 0.0;
+    bool refCompleted = false;
+    bool refTimedOut = false;
+    std::string note;  // top-level problem, empty if none
+    int totalTrials = 0;
+    bool cancelled = false;
+    std::string cancelReason;
+};
+
+struct Progress {
+    int groupsDone = 0;
+    int groupsTotal = 0;
+    int trials = 0;
+    int currentNumber = 0;  // action number being analysed (0 = reference)
+    int currentOffset = 0;
+};
+
+class Analyzer {
+public:
+    Analyzer(MacroFile macro, AnalyzerSettings s) : macro_(std::move(macro)), s_(s) {
+        gs_ = buildGroups(macro_.actions, std::max(1e-6, s_.epsilon));
+        report_.groups.resize(gs_.groups.size());
+        for (size_t i = 0; i < gs_.groups.size(); ++i) {
+            const Group& g = gs_.groups[i];
+            GroupReport& r = report_.groups[i];
+            r.group = static_cast<int>(i);
+            r.player = g.player;
+            r.x = g.x;
+            r.kind = g.kind;
+            r.number = g.number;
+            r.actionCount = static_cast<int>(g.actions.size());
+        }
+        refFire_.assign(gs_.groups.size(), -1);
+    }
+
+    const Report& report() const { return report_; }
+    const GroupSet& groups() const { return gs_; }
+    const MacroFile& macro() const { return macro_; }
+    bool finished() const { return stage_ == Stage::Done; }
+
+    Progress progress() const {
+        Progress p;
+        p.groupsTotal = static_cast<int>(selected_.size());
+        p.groupsDone = std::min<int>(nextSel_ - (cur_ ? 1 : 0), p.groupsTotal);
+        p.trials = report_.totalTrials;
+        if (cur_) {
+            p.currentNumber = gs_.groups[cur_->group].number;
+            p.currentOffset = pendingOffset_;
+        }
+        return p;
+    }
+
+    void cancel(const std::string& why) {
+        report_.cancelled = true;
+        report_.cancelReason = why;
+        if (cur_) finalizeGroup();
+        stage_ = Stage::Done;
+        pendingSpec_.reset();
+    }
+
+    std::optional<TrialSpec> nextTrial() {
+        switch (stage_) {
+            case Stage::Done: return std::nullopt;
+            case Stage::NeedReference: {
+                if (macro_.actions.empty()) { stage_ = Stage::Done; return std::nullopt; }
+                TrialSpec t;
+                t.actions = macro_.actions;
+                t.recordX = true;
+                t.stopAfterLastFire = std::max(s_.horizonMinTicks, s_.radius) + 12;
+                t.maxTick = s_.maxRunTicks;
+                pendingSpec_ = t;
+                stage_ = Stage::WaitReference;
+                return pendingSpec_;
+            }
+            case Stage::WaitReference:
+            case Stage::WaitTrial:
+                return pendingSpec_;  // submit() not called yet: same trial again
+            case Stage::Search: break;
+        }
+
+        while (true) {
+            if (!cur_) {
+                if (nextSel_ >= selected_.size()) { stage_ = Stage::Done; return std::nullopt; }
+                beginGroup(selected_[nextSel_++]);
+                continue;
+            }
+            std::optional<int> off = cur_->search.next();
+            if (!off) { finalizeGroup(); continue; }
+            pendingOffset_ = *off;
+            pendingSpec_ = buildTrial(*off);
+            stage_ = Stage::WaitTrial;
+            return pendingSpec_;
+        }
+    }
+
+    void submit(const TrialResult& r) {
+        if (r.aborted) { cancel("run aborted (level reset, paused or left)"); return; }
+        if (stage_ == Stage::WaitReference) { processReference(r); return; }
+        if (stage_ != Stage::WaitTrial || !cur_) return;
+        ++report_.totalTrials;
+        cur_->search.submit(pendingOffset_, classify(r));
+        pendingSpec_.reset();
+        stage_ = Stage::Search;
+    }
+
+private:
+    enum class Stage { NeedReference, WaitReference, Search, WaitTrial, Done };
+
+    struct Current {
+        int group = 0;
+        int refTick = 0;
+        int endTick = 0;
+        bool capped = false;
+        WindowSearch search;
+        Current(int g, int t, int e, bool c, const SearchConfig& cfg) : group(g), refTick(t), endTick(e), capped(c), search(cfg) {}
+    };
+
+    bool isNoOp(int gi) const { return gs_.groups[gi].kind == GroupKind::NoOp; }
+
+    void processReference(const TrialResult& r) {
+        report_.referenceRan = true;
+        report_.refTicks = r.ticksRun;
+        report_.refDied = r.died;
+        report_.refDeathTick = r.deathTick;
+        report_.refDeathX = r.deathX;
+        report_.refCompleted = r.completed;
+        report_.refTimedOut = r.timedOut;
+        xs_ = r.xs;
+        refDeath_ = r.died ? r.deathTick : -1;
+        pendingSpec_.reset();
+
+        if (xs_.empty() || r.ticksRun <= 0) {
+            report_.note = "the reference run produced no physics ticks (is the tick hook firing?)";
+            stage_ = Stage::Done;
+            return;
+        }
+        for (size_t gi = 0; gi < gs_.groups.size(); ++gi) {
+            int id = gs_.groups[gi].actions[0];
+            refFire_[gi] = (id < static_cast<int>(r.firedTick.size())) ? r.firedTick[id] : -1;
+        }
+
+        // Which groups to analyse.
+        for (size_t gi = 0; gi < gs_.groups.size(); ++gi) {
+            bool pick = true;
+            if (s_.onlyAction > 0) {
+                pick = false;
+                for (int id : gs_.groups[gi].actions) if (id + 1 == s_.onlyAction) pick = true;
+            }
+            if (pick) selected_.push_back(static_cast<int>(gi));
+        }
+        if (selected_.empty()) {
+            report_.note = "action #" + std::to_string(s_.onlyAction) + " does not exist in this macro";
+            stage_ = Stage::Done;
+            return;
+        }
+        stage_ = Stage::Search;
+    }
+
+    bool monotoneAt(int t) const {
+        if (t <= 0) return true;
+        if (t >= static_cast<int>(xs_.size())) return false;
+        return xs_[t] - xs_[t - 1] > 2.0 * s_.epsilon;
+    }
+
+    // Neighbour = previous/next group of the SAME player that actually changes state.
+    int neighbourTick(int gi, int dir) const {
+        const auto& list = gs_.byPlayer[gs_.groups[gi].player];
+        int at = -1;
+        for (size_t i = 0; i < list.size(); ++i) if (list[i] == gi) at = static_cast<int>(i);
+        for (int i = at + dir; i >= 0 && i < static_cast<int>(list.size()); i += dir) {
+            if (isNoOp(list[i])) continue;
+            int t = refFire_[list[i]];
+            if (t >= 0 && (refDeath_ < 0 || t < refDeath_)) return t;
+            if (dir > 0) return -1;  // unreached: nothing to collide with
+        }
+        return -1;
+    }
+
+    void beginGroup(int gi) {
+        GroupReport& rep = report_.groups[gi];
+        if (isNoOp(gi)) { rep.state = GroupState::Redundant; return; }
+        const int T = refFire_[gi];
+        rep.refTick = T;
+        if (T < 0 || (refDeath_ >= 0 && T >= refDeath_)) { rep.state = GroupState::Unreached; return; }
+
+        const int last = static_cast<int>(xs_.size()) - 1;  // last tick whose x is known
+        const int R = std::max(1, s_.radius);
+
+        SearchConfig cfg;
+        cfg.thorough = s_.thorough;
+        cfg.probeBeyond = std::max(0, s_.probeBeyond);
+        cfg.verify = s_.verify;
+
+        // ---- range, clipped by neighbours / start / end of data
+        const int prevT = neighbourTick(gi, -1);
+        const int nextT = neighbourTick(gi, +1);
+        const int minTick = (prevT >= 0) ? prevT + 1 : 0;
+        const Limit minReason = (prevT >= 0) ? Limit::Neighbor : Limit::Start;
+        int maxTick = last;
+        Limit maxReason = Limit::RefEnd;
+        if (nextT >= 0 && nextT - 1 < maxTick) { maxTick = nextT - 1; maxReason = Limit::Neighbor; }
+
+        cfg.rangeLo = -R; cfg.limitLo = Limit::Radius;
+        if (minTick - T > -R) { cfg.rangeLo = minTick - T; cfg.limitLo = minReason; }
+        cfg.rangeHi = R; cfg.limitHi = Limit::Radius;
+        if (maxTick - T < R) { cfg.rangeHi = maxTick - T; cfg.limitHi = maxReason; }
+        cfg.rangeLo = std::min(cfg.rangeLo, 0);
+        cfg.rangeHi = std::max(cfg.rangeHi, 0);
+
+        // ---- the position-based macro can only place an input on a tick if x grows every tick
+        for (int d = 1; d <= cfg.rangeHi; ++d) {
+            if (!monotoneAt(T + d)) { cfg.rangeHi = d - 1; cfg.limitHi = Limit::Plateau; break; }
+        }
+        for (int d = 0; d >= cfg.rangeLo; --d) {
+            if (!monotoneAt(T + d)) { cfg.rangeLo = d + 1; cfg.limitLo = Limit::Plateau; break; }
+        }
+        if (cfg.rangeLo > 0 || cfg.rangeHi < 0) {  // not even the original tick is unique
+            rep.state = GroupState::Unmappable;
+            return;
+        }
+
+        // ---- end tick: identical for every offset, so results are comparable
+        int end;
+        bool capped = false;
+        if (s_.horizonToEnd) {
+            end = last;
+        } else {
+            end = T + std::max(1, s_.horizonMinTicks);
+            const auto& list = gs_.byPlayer[gs_.groups[gi].player];
+            int at = -1;
+            for (size_t i = 0; i < list.size(); ++i) if (list[i] == gi) at = static_cast<int>(i);
+            int seen = 0;
+            for (int i = at + 1; i < static_cast<int>(list.size()) && seen < s_.horizonGroups; ++i) {
+                if (isNoOp(list[i])) continue;
+                ++seen;
+                int t = refFire_[list[i]];
+                if (t < 0) break;
+                end = std::max(end, t + 6);
+            }
+        }
+        int cap = last;
+        if (refDeath_ >= 0) cap = std::min(cap, refDeath_ - 1);
+        if (end > cap) { end = cap; capped = true; }
+        if (end < T) { end = T; capped = true; }
+
+        rep.state = GroupState::Analyzed;
+        rep.endTick = end;
+        rep.horizonCapped = capped;
+        cur_ = std::make_unique<Current>(gi, T, end, capped, cfg);
+    }
+
+    void finalizeGroup() {
+        GroupReport& rep = report_.groups[cur_->group];
+        rep.w = cur_->search.result();
+        rep.refTick = cur_->refTick;
+        rep.endTick = cur_->endTick;
+        rep.horizonCapped = cur_->capped;
+        cur_.reset();
+    }
+
+    TrialSpec buildTrial(int off) const {
+        const Group& g = gs_.groups[cur_->group];
+        TrialSpec t;
+        t.actions = macro_.actions;
+        if (off != 0) {
+            const double x = xs_[cur_->refTick + off];
+            for (int id : g.actions) t.actions[id].x = x;
+            std::stable_sort(t.actions.begin(), t.actions.end(),
+                             [](const MacroAction& a, const MacroAction& b) { return a.x < b.x; });
+        }
+        t.endTick = cur_->endTick;
+        t.maxTick = cur_->endTick + 16;
+        t.recordX = false;
+        return t;
+    }
+
+    Verdict classify(const TrialResult& r) const {
+        const Group& g = gs_.groups[cur_->group];
+        int pos = -1;
+        for (size_t i = 0; i < pendingSpec_->actions.size(); ++i) {
+            if (pendingSpec_->actions[i].id == g.actions[0]) { pos = static_cast<int>(i); break; }
+        }
+        const int expect = cur_->refTick + pendingOffset_;
+        const int fired = (pos >= 0 && pos < static_cast<int>(r.firedTick.size())) ? r.firedTick[pos] : -1;
+        const int end = cur_->endTick;
+
+        if (fired < 0) return r.died ? Verdict::Fail : Verdict::Invalid;
+        if (fired != expect) return Verdict::Invalid;  // x->tick mapping drifted (speed change, other path)
+        if (r.died && r.deathTick <= end) return Verdict::Fail;
+        if (!r.completed && r.ticksRun <= end) return Verdict::Invalid;  // stopped before the end tick
+        return Verdict::Pass;
+    }
+
+    MacroFile macro_;
+    AnalyzerSettings s_;
+    GroupSet gs_;
+    Report report_;
+    Stage stage_ = Stage::NeedReference;
+    std::vector<double> xs_;
+    std::vector<int> refFire_;
+    int refDeath_ = -1;
+    std::vector<int> selected_;
+    size_t nextSel_ = 0;
+    std::unique_ptr<Current> cur_;
+    std::optional<TrialSpec> pendingSpec_;
+    int pendingOffset_ = 0;
+};
+
+}  // namespace fw
