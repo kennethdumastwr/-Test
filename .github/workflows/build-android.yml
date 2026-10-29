@@ -1,0 +1,33 @@
+name: Build Percent Frame Window for Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run core logic tests
+        run: ./tests/run_tests.sh
+
+  build-android64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build Android 64-bit Geode mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          target: Android64
+
+      - name: Upload .geode file
+        uses: actions/upload-artifact@v4
+        with:
+          name: percentframewindow-android64
+          path: ${{ steps.build.outputs.build-output }}
+          
