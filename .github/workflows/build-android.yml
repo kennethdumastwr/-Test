@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run core logic tests
-        run: ./tests/run_tests.sh
+        run: bash tests/run_tests.sh
 
   build-android64:
     runs-on: ubuntu-latest
