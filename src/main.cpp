@@ -352,9 +352,11 @@ namespace {
 // ------------------------------------------------------------------ physics tick hooks
 class $modify(FWBaseLayer, GJBaseGameLayer) {
     // One call = one physics tick. The tick index and the player's x BEFORE the tick are what the macro format is about.
-    void processCommands(float dt) {
-        if (!g.trialActive || static_cast<GJBaseGameLayer*>(PlayLayer::get()) != this) {
-            GJBaseGameLayer::processCommands(dt);
+    // 2.2081 signature: (dt, isHalfTick, isLastTick). Half ticks are not physics ticks of the macro's 240 TPS,
+    // so they pass straight through; if the report says the game ran at ~480 ticks/s, flip this condition.
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (isHalfTick || !g.trialActive || static_cast<GJBaseGameLayer*>(PlayLayer::get()) != this) {
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
         const double x = playerX(m_player1);
@@ -370,7 +372,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             g.injecting = false;
         }
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         ++g.tick;
     }
 
