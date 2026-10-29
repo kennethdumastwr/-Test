@@ -1,0 +1,160 @@
+{
+  "geode": "5.10.1",
+  "gd": {
+    "android": "2.2081"
+  },
+  "id": "yourname.percentframewindow",
+  "name": "Percent Frame Window",
+  "version": "v1.0.0",
+  "developer": "yourname",
+  "description": "Frame window counter (240 TPS) for percent-macro position macros: how many ticks earlier/later each click and release can be and still pass.",
+  "tags": [
+    "gameplay"
+  ],
+  "settings": {
+    "scan-section": {
+      "name": "Scan",
+      "type": "title"
+    },
+    "scan-radius": {
+      "name": "Scan radius (ticks)",
+      "description": "Maximum ticks tested on each side of the recorded input.",
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 40,
+      "control": {
+        "slider": true
+      }
+    },
+    "thorough-scan": {
+      "name": "Thorough scan",
+      "description": "Test EVERY offset in the radius instead of stopping at the first fail on each side. Slower, but finds separate passing islands.",
+      "type": "bool",
+      "default": false
+    },
+    "probe-beyond": {
+      "name": "Probe beyond first fail",
+      "description": "Extra offsets tested past the first fail on each side to detect islands (ignored in thorough mode).",
+      "type": "int",
+      "default": 1,
+      "min": 0,
+      "max": 6,
+      "control": {
+        "slider": true
+      }
+    },
+    "verify-boundaries": {
+      "name": "Verify boundaries",
+      "description": "Run each boundary offset twice. A disagreement shrinks the window and marks it UNSTABLE.",
+      "type": "bool",
+      "default": true
+    },
+    "only-action": {
+      "name": "Only action #",
+      "description": "Analyse only the input containing this action number (1 = first data line). 0 = analyse everything.",
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 100000,
+      "control": {
+        "input": true,
+        "slider": false
+      }
+    },
+    "pass-section": {
+      "name": "What counts as PASS",
+      "type": "title"
+    },
+    "horizon-groups": {
+      "name": "Survive N following inputs",
+      "description": "A trial passes if the player survives until this many later inputs (same player) fired.",
+      "type": "int",
+      "default": 2,
+      "min": 0,
+      "max": 20,
+      "control": {
+        "slider": true
+      }
+    },
+    "horizon-min-ticks": {
+      "name": "Survive at least (ticks)",
+      "description": "...and at least this many ticks after the tested input.",
+      "type": "int",
+      "default": 120,
+      "min": 10,
+      "max": 2400,
+      "control": {
+        "input": true,
+        "slider": false
+      }
+    },
+    "horizon-to-end": {
+      "name": "Survive to end of run",
+      "description": "Strictest: survive until the end of the reference run.",
+      "type": "bool",
+      "default": false
+    },
+    "engine-section": {
+      "name": "Engine",
+      "type": "title"
+    },
+    "speed": {
+      "name": "Speed (updates per frame)",
+      "description": "How many 1/60s game updates run per real frame while analysing. Lower it if the game stutters.",
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 64,
+      "control": {
+        "slider": true
+      }
+    },
+    "expected-tps": {
+      "name": "Expected TPS",
+      "description": "Physics ticks per second the results are labelled with. A warning is shown if the game actually runs differently.",
+      "type": "int",
+      "default": 240,
+      "min": 30,
+      "max": 1000,
+      "control": {
+        "input": true,
+        "slider": false
+      }
+    },
+    "x-epsilon": {
+      "name": "X tolerance",
+      "description": "Playback fires an input when player x >= action x - this value.",
+      "type": "float",
+      "default": 0.001,
+      "min": 1e-05,
+      "max": 0.05,
+      "control": {
+        "input": true,
+        "slider": false
+      }
+    },
+    "files-section": {
+      "name": "Files",
+      "type": "title"
+    },
+    "macros-dir": {
+      "name": "Macros folder",
+      "description": "Leave empty to use the percent-macro mod's folder: .../save/geode/mods/yourname.percentmacro/macros",
+      "type": "string",
+      "default": ""
+    },
+    "save-report": {
+      "name": "Save report files",
+      "description": "Write <macro>.windows.txt and .csv to this mod's save folder under results/.",
+      "type": "bool",
+      "default": true
+    },
+    "settings-button": {
+      "name": "Settings button",
+      "description": "Adds a FW Settings button to the pause menu.",
+      "type": "bool",
+      "default": true
+    }
+  }
+}
