@@ -45,6 +45,7 @@ namespace {
         fw::Cursor cursor;
         bool trialActive = false;
         bool injecting = false;      // true while WE call handleButton (real touches are ignored otherwise)
+        bool inFrame = false;        // true while we drive a full PlayLayer frame (hook must pass straight through)
         bool resettingByUs = false;  // lets the resetLevel hook tell our restarts from foreign ones
         int tick = 0;                // physics ticks executed in the current trial
         int lastFire = -1;
@@ -391,6 +392,10 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
     }
 
     void update(float dt) {
+        if (g.inFrame) {
+            GJBaseGameLayer::update(dt);
+            return;
+        }
         PlayLayer* pl = PlayLayer::get();
         if (!pl || static_cast<GJBaseGameLayer*>(pl) != this) {
             GJBaseGameLayer::update(dt);
@@ -411,7 +416,9 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         while (budget-- > 0 && g.phase == Phase::Running) {
             if (!g.trialActive && !startNextTrial(pl)) break;
             const int before = g.tick;
-            GJBaseGameLayer::update(kStepDt);
+            g.inFrame = true;
+            pl->update(kStepDt);  // whole PlayLayer frame, not just the base-layer part
+            g.inFrame = false;
             ++g.updateCalls;
             g.tickTotal += g.tick - before;
             if (g.tick == before) {
