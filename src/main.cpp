@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -59,6 +60,7 @@ namespace {
         double expectedTps = 240.0;
         bool saveReport = true;
         int ignoreEarlyTicks = 0;
+        int anticheatHits = 0;       // hits of the game's hidden anti-cheat spike ignored during this analysis
         std::string probe;           // x/y of the first ticks of a reference run (shown if the run dies early)
 
         Ref<CCLabelBMFont> label;
@@ -196,6 +198,7 @@ namespace {
                 if (std::fabs(observed - g.expectedTps) > g.expectedTps * 0.02) warn = "WARNING: " + warn + ". Windows use the measured rate.";
                 tps = observed;
             }
+            if (g.anticheatHits > 0) warn += std::string(warn.empty() ? "" : "; ") + "ignored " + std::to_string(g.anticheatHits) + " anti-cheat spike hits";
             fw::ReportStyle plain, tagged;
             plain.tps = tagged.tps = tps;
             tagged.tags = true;
@@ -344,6 +347,7 @@ namespace {
         g.macroName = fileName;
         g.tickTotal = 0;
         g.updateCalls = 0;
+        g.anticheatHits = 0;
         g.trialActive = false;
         g.analyzer = std::make_unique<fw::Analyzer>(std::move(mf), readSettings());
         g.phase = Phase::Running;  // the next update() starts the reference run
@@ -439,6 +443,13 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
 class $modify(FWPlayLayer, PlayLayer) {
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
         if (g.trialActive && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == static_cast<GJBaseGameLayer*>(this)) {
+            // The game's hidden anti-cheat spike sits on the spawn point (id 8 at x=0, y=105). Our fast fixed-step loop trips it
+            // and it would "kill" the player every tick. Analysis runs never reach a completion screen and submit nothing,
+            // so during analysis ONLY it is ignored (and counted in the report). Normal play is untouched.
+            if (obj && obj->m_objectID == 8 && std::fabs(obj->getPositionX()) < 0.5 && std::fabs(obj->getPositionY() - 105.0) < 0.5) {
+                ++g.anticheatHits;
+                return;
+            }
             if (g.tick < g.ignoreEarlyTicks) return;  // user-chosen workaround for spawn glitches
             if (!g.res.died) {
                 g.res.died = true;
