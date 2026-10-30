@@ -19,6 +19,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 
@@ -28,6 +29,8 @@
 #include "playback.hpp"
 #include "report.hpp"
 
+// Checkpoint fast mode uses PlayLayer::createCheckpoint / loadFromCheckpoint. If your Geode bindings do not have them,
+// build with -DFW_NO_CHECKPOINTS (see CMakeLists.txt) and everything falls back to restarting from the level start.
 using namespace geode::prelude;
 namespace fs = std::filesystem;
 
@@ -63,6 +66,9 @@ namespace {
         int ignoreEarlyTicks = 0;
         int overlayRevision = 0;     // bumped when new results are saved so the markers reload
         int anticheatHits = 0;       // hits of the game's hidden anti-cheat spike ignored during this analysis
+#ifndef FW_NO_CHECKPOINTS
+        std::map<int, Ref<CheckpointObject>> cps;  // reference run: checkpoint taken at the end of tick N
+#endif
         std::string probe;           // x/y of the first ticks of a reference run (shown if the run dies early)
 
         Ref<CCLabelBMFont> label;
@@ -137,6 +143,8 @@ namespace {
         s.horizonToEnd = mod->getSettingValue<bool>("horizon-to-end");
         s.epsilon = mod->getSettingValue<double>("x-epsilon");
         s.onlyAction = static_cast<int>(mod->getSettingValue<int64_t>("only-action"));
+        s.maxWidth = static_cast<int>(mod->getSettingValue<int64_t>("max-width"));
+        s.useCheckpoints = mod->getSettingValue<bool>("use-checkpoints");
         const double tps = static_cast<double>(mod->getSettingValue<int64_t>("expected-tps"));
         s.maxRunTicks = static_cast<int>(tps * 180.0);  // 3 minutes of game time per run
         return s;
@@ -162,8 +170,12 @@ namespace {
     }
 
     struct OverlayState {
-        Ref<CCNode> world;  // number above every analysed click, scrolls with the level
-        Ref<CCNode> hud;    // 1 / 2 / 3 / 4 / 5+ counter, fixed on screen
+        Ref<CCNode> world;                  // rings + numbers, scrolls with the level
+        Ref<CCNode> hud;                    // 1 / 2 / 3 / 4 / 5+ counter, fixed on screen
+        Ref<CCLabelBMFont> hudLabels[5];
+        std::vector<fw::OverlayItem> items; // sorted by x
+        int passed = 0;                     // how many clicks the player already went past
+        double lastX = 0.0;
         std::string key;
     } ov;
 
@@ -172,7 +184,58 @@ namespace {
         if (ov.hud) ov.hud->removeFromParent();
         ov.world = nullptr;
         ov.hud = nullptr;
+        for (auto& l : ov.hudLabels) l = nullptr;
+        ov.items.clear();
+        ov.passed = 0;
         ov.key.clear();
+    }
+
+    std::vector<CCPoint> circlePoints(float cx, float cy, float r, int n = 24) {
+        std::vector<CCPoint> pts;
+        for (int i = 0; i < n; ++i) {
+            const float a = 6.2831853f * static_cast<float>(i) / static_cast<float>(n);
+            pts.push_back(ccp(cx + r * std::cos(a), cy + r * std::sin(a)));
+        }
+        return pts;
+    }
+
+    // counter = clicks the player already passed, like in the video
+    void refreshHud() {
+        int h[5];
+        std::vector<fw::OverlayItem> done(ov.items.begin(), ov.items.begin() + std::min<size_t>(ov.passed, ov.items.size()));
+        fw::histogram(done, h);
+        const char* names[5] = {"1:", "2:", "3:", "4:", "5+:"};
+        for (int i = 0; i < 5; ++i)
+            if (ov.hudLabels[i]) ov.hudLabels[i]->setString((std::string(names[i]) + "  " + std::to_string(h[i])).c_str());
+    }
+
+    // expanding circle when the player reaches a click
+    void pulse(const fw::OverlayItem& it) {
+        if (!ov.world) return;
+        const fw::Rgb c = fw::widthColor(it.width);
+        auto d = CCDrawNode::create();
+        auto pts = circlePoints(0.f, 0.f, 8.f);
+        const ccColor4F fill = ccc4f(c.r / 255.f, c.g / 255.f, c.b / 255.f, 0.35f);
+        d->drawPolygon(pts.data(), static_cast<unsigned int>(pts.size()), fill, 0.f, fill);
+        d->setPosition(ccp(static_cast<float>(it.x), static_cast<float>(it.y)));
+        ov.world->addChild(d, 5);
+        d->runAction(CCSequence::create(CCScaleTo::create(0.3f, 3.2f), CCRemoveSelf::create(), nullptr));
+    }
+
+    void updateOverlayProgress(PlayLayer* pl) {
+        if (!ov.world || ov.items.empty()) return;
+        const double x = playerX(pl->m_player1);
+        const double eps = 0.001;
+        const int n = static_cast<int>(std::upper_bound(ov.items.begin(), ov.items.end(), x + eps,
+                                                        [](double v, const fw::OverlayItem& it) { return v < it.x; }) - ov.items.begin());
+        if (n == ov.passed) { ov.lastX = x; return; }
+        const bool forward = n > ov.passed && x >= ov.lastX;
+        if (forward && n - ov.passed <= 3) {
+            for (int k = ov.passed; k < n; ++k) pulse(ov.items[k]);
+        }
+        ov.passed = n;  // a respawn / restart (n went down, or a big jump) just resyncs silently
+        ov.lastX = x;
+        refreshHud();
     }
 
     void refreshOverlay(PlayLayer* pl) {
@@ -206,35 +269,46 @@ namespace {
         if (!sr.level.empty() && lower(sr.level) != lower(playing))
             toast("Windows were analysed on level \"" + sr.level + "\" (you are on \"" + playing + "\")", NotificationIcon::Warning);
 
+        ov.items = sr.items;
+        std::sort(ov.items.begin(), ov.items.end(), [](const fw::OverlayItem& l, const fw::OverlayItem& r) { return l.x < r.x; });
+        ov.passed = static_cast<int>(std::upper_bound(ov.items.begin(), ov.items.end(), playerX(pl->m_player1) + 0.001,
+                                                      [](double v, const fw::OverlayItem& it) { return v < it.x; }) - ov.items.begin());
+        ov.lastX = playerX(pl->m_player1);
+
         auto world = CCNode::create();
-        for (const fw::OverlayItem& it : sr.items) {
-            auto label = CCLabelBMFont::create(fw::markerText(it).c_str(), "bigFont.fnt");
+        auto rings = CCDrawNode::create();
+        for (const fw::OverlayItem& it : ov.items) {
             const fw::Rgb c = fw::widthColor(it.width);
+            const ccColor4F col = ccc4f(c.r / 255.f, c.g / 255.f, c.b / 255.f, 1.f);
+            auto pts = circlePoints(static_cast<float>(it.x), static_cast<float>(it.y), 7.5f);
+            rings->drawPolygon(pts.data(), static_cast<unsigned int>(pts.size()), ccc4f(0.f, 0.f, 0.f, 0.f), 2.4f, col);  // hollow ring
+
+            auto label = CCLabelBMFont::create(fw::markerText(it).c_str(), "bigFont.fnt");
             label->setColor({c.r, c.g, c.b});
-            label->setScale(0.45f);
-            label->setPosition({static_cast<float>(it.x), static_cast<float>(it.y) + 22.f});
-            world->addChild(label);
+            label->setScale(0.4f);
+            label->setPosition({static_cast<float>(it.x), static_cast<float>(it.y) + 19.f});
+            world->addChild(label, 2);
         }
+        world->addChild(rings, 1);
         pl->m_objectLayer->addChild(world, 1000);
         ov.world = world;
 
         if (mod->getSettingValue<bool>("overlay-hud")) {
             auto hud = CCNode::create();
-            int h[5];
-            fw::histogram(sr.items, h);
-            const char* names[5] = {"1:", "2:", "3:", "4:", "5+:"};
             const auto win = CCDirector::sharedDirector()->getWinSize();
             for (int i = 0; i < 5; ++i) {
-                auto label = CCLabelBMFont::create((std::string(names[i]) + "  " + std::to_string(h[i])).c_str(), "bigFont.fnt");
+                auto label = CCLabelBMFont::create("0", "bigFont.fnt");
                 const fw::Rgb c = fw::widthColor(i + 1);
                 label->setColor({c.r, c.g, c.b});
                 label->setScale(0.5f);
                 label->setAnchorPoint({0.f, 1.f});
                 label->setPosition({8.f, win.height - 40.f - 17.f * i});
                 hud->addChild(label);
+                ov.hudLabels[i] = label;
             }
             pl->addChild(hud, 1000);
             ov.hud = hud;
+            refreshHud();
         }
     }
 
@@ -331,6 +405,9 @@ namespace {
 
     void endSession(PlayLayer* pl, bool showReport, bool restartLevel) {
         g.phase = Phase::Idle;
+#ifndef FW_NO_CHECKPOINTS
+        g.cps.clear();
+#endif
         g.trialActive = false;
         removeLabel();
 
@@ -383,6 +460,8 @@ namespace {
         endSession(pl, true, restartLevel);
     }
 
+    void injectFires(GJBaseGameLayer* layer, const std::vector<fw::Fire>& fires);
+
     bool startNextTrial(PlayLayer* pl) {
         auto spec = g.analyzer->nextTrial();
         if (!spec) {
@@ -394,21 +473,41 @@ namespace {
         g.res = fw::TrialResult{};
         g.res.firedTick.assign(g.spec.actions.size(), -1);
         if (g.spec.recordX) g.res.xs.reserve(4096);
-        g.tick = 0;
         g.lastFire = -1;
         g.idleCalls = 0;
         g.probe.clear();
         g.trialActive = true;
 
-        g.resettingByUs = true;
-        pl->resetLevelFromStart();
-        g.resettingByUs = false;
+        bool restored = false;
+#ifndef FW_NO_CHECKPOINTS
+        if (g.spec.checkpointTick >= 0) {
+            auto it = g.cps.find(g.spec.checkpointTick);
+            if (it != g.cps.end() && it->second) {
+                g.resettingByUs = true;
+                pl->loadFromCheckpoint(it->second);  // state at the end of that tick: ticks stay absolute
+                g.resettingByUs = false;
+                g.tick = g.spec.checkpointTick + 1;
+                restored = true;
+            }
+        }
+#endif
+        if (!restored) {
+            g.tick = 0;
+            g.resettingByUs = true;
+            pl->resetLevelFromStart();
+            g.resettingByUs = false;
+        }
 
-        // make sure nothing is held from the previous trial
+        // nothing may stay held from the previous trial; then continue the macro from the player's position
         g.injecting = true;
         pl->handleButton(false, static_cast<int>(PlayerButton::Jump), true);
         pl->handleButton(false, static_cast<int>(PlayerButton::Jump), false);
         g.injecting = false;
+        if (restored) {
+            std::vector<fw::Fire> fires;
+            g.cursor.seekTo(playerX(pl->m_player1), fires);  // re-presses if the macro was mid-hold
+            injectFires(pl, fires);
+        }
         return true;
     }
 
@@ -495,7 +594,18 @@ namespace {
         g.updateCalls = 0;
         g.anticheatHits = 0;
         g.trialActive = false;
-        g.analyzer = std::make_unique<fw::Analyzer>(std::move(mf), readSettings());
+        fw::AnalyzerSettings settings = readSettings();
+#ifdef FW_NO_CHECKPOINTS
+        settings.useCheckpoints = false;
+#else
+        settings.useCheckpoints = settings.useCheckpoints && pl->m_isPracticeMode;  // checkpoints are a practice-mode feature
+#endif
+#ifndef FW_NO_CHECKPOINTS
+        g.cps.clear();
+#endif
+        if (settings.useCheckpoints) toast("Practice mode: fast checkpoint analysis (your own checkpoints get cleared)");
+        else if (readSettings().useCheckpoints) toast("Not in practice mode: analysing from the level start (slower)", NotificationIcon::Warning);
+        g.analyzer = std::make_unique<fw::Analyzer>(std::move(mf), settings);
         g.phase = Phase::Running;  // the next update() starts the reference run
         pause->onResume(nullptr);
     }
@@ -542,6 +652,17 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+#ifndef FW_NO_CHECKPOINTS
+        // reference run: a checkpoint at the END of every tick in which inputs fired = "right after the release of click N"
+        if (g.spec.captureCheckpoints && !fires.empty()) {
+            if (PlayLayer* pl = PlayLayer::get()) {
+                if (CheckpointObject* cp = pl->createCheckpoint()) {
+                    g.cps[g.tick] = cp;
+                    g.res.checkpointTicks.push_back(g.tick);
+                }
+            }
+        }
+#endif
         ++g.tick;
     }
 
@@ -567,6 +688,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             FLAlertLayer::create(nullptr, title.c_str(), text, "Close", nullptr, 420.f, true, 250.f, 0.65f)->show();
         }
         refreshOverlay(pl);
+        updateOverlayProgress(pl);
         refreshPlayback(pl);
         if (g.phase != Phase::Running || !g.analyzer) {
             GJBaseGameLayer::update(dt);

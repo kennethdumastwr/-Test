@@ -21,7 +21,7 @@ namespace fw {
 enum class Verdict : unsigned char { Pass, Fail, Invalid };
 
 // Why a window edge is NOT a real FAIL boundary.
-enum class Limit : unsigned char { None, Radius, Neighbor, Plateau, RefEnd, Start };
+enum class Limit : unsigned char { None, Radius, Neighbor, Plateau, RefEnd, Start, Cap };
 
 inline char limitChar(Limit l) {
     switch (l) {
@@ -30,6 +30,7 @@ inline char limitChar(Limit l) {
         case Limit::Plateau: return 'P';
         case Limit::RefEnd: return 'E';
         case Limit::Start: return 'S';
+        case Limit::Cap: return 'C';
         default: return ' ';
     }
 }
@@ -42,6 +43,7 @@ struct SearchConfig {
     bool thorough = false;  // test every offset in range, not just outward from 0
     int probeBeyond = 1;    // extra offsets tested past the first FAIL (finds islands)
     bool verify = true;     // run each boundary offset twice
+    int maxWidth = 0;       // > 0: stop as soon as the window is at least this wide (reported as "N+")
 };
 
 struct WindowResult {
@@ -52,8 +54,10 @@ struct WindowResult {
     bool island = false;      // a PASS exists beyond the first FAIL
     bool unstable = false;    // same offset gave different results
     bool drift = false;       // a trial fired the input on a different tick than planned
+    bool capped = false;      // window reached SearchConfig::maxWidth: reported as capWidth+ and not measured further
+    int capWidth = 0;
     int trials = 0;
-    int width() const { return baseFailed ? 0 : hi - lo + 1; }
+    int width() const { return baseFailed ? 0 : (capped ? capWidth : hi - lo + 1); }
 };
 
 class WindowSearch {
@@ -98,6 +102,12 @@ public:
         Scan s = scan();
         r.lo = s.lo;
         r.hi = s.hi;
+        if (s.capped) {
+            r.capped = true;
+            r.capWidth = cfg_.maxWidth;
+            r.clipHi = Limit::Cap;
+            return r;
+        }
         if (!s.hiFail && s.hi == cfg_.rangeHi) r.clipHi = cfg_.limitHi;
         if (!s.loFail && s.lo == cfg_.rangeLo) r.clipLo = cfg_.limitLo;
         for (int o = cfg_.rangeLo; o <= cfg_.rangeHi; ++o) {
@@ -111,6 +121,7 @@ private:
         int lo = 0, hi = 0;
         std::optional<int> loFail, hiFail;
         std::optional<int> need;  // first untested offset the scan ran into
+        bool capped = false;
     };
 
     size_t idx(int o) const { return static_cast<size_t>(o - cfg_.rangeLo); }
@@ -123,17 +134,26 @@ private:
         return true;
     }
 
+    // Expands +1, -1, +2, -2 ... so both sides grow together; stops a side at its first FAIL,
+    // and everything as soon as the window is wide enough (maxWidth).
     Scan scan() const {
         Scan s;
-        for (int d = 1; d <= cfg_.rangeHi; ++d) {
-            if (!tested(d)) { s.need = d; return s; }
-            if (!passes(d)) { s.hiFail = d; break; }
-            s.hi = d;
-        }
-        for (int d = -1; d >= cfg_.rangeLo; --d) {
-            if (!tested(d)) { s.need = d; return s; }
-            if (!passes(d)) { s.loFail = d; break; }
-            s.lo = d;
+        int dr = 1, dl = -1;
+        bool right = cfg_.rangeHi >= 1, left = cfg_.rangeLo <= -1;
+        auto wideEnough = [&] { return cfg_.maxWidth > 0 && (s.hi - s.lo + 1) >= cfg_.maxWidth; };
+        while (right || left) {
+            if (right) {
+                if (!tested(dr)) { s.need = dr; return s; }
+                if (!passes(dr)) { s.hiFail = dr; right = false; }
+                else { s.hi = dr; if (++dr > cfg_.rangeHi) right = false; }
+                if (wideEnough()) { s.capped = true; return s; }
+            }
+            if (left) {
+                if (!tested(dl)) { s.need = dl; return s; }
+                if (!passes(dl)) { s.loFail = dl; left = false; }
+                else { s.lo = dl; if (--dl < cfg_.rangeLo) left = false; }
+                if (wideEnough()) { s.capped = true; return s; }
+            }
         }
         return s;
     }
@@ -148,6 +168,7 @@ private:
         // 2. expand outward until the first FAIL on each side
         Scan s = scan();
         if (s.need) return s.need;
+        if (s.capped) return std::nullopt;  // wide enough: label it N+ and move on
         // 3. probe a few offsets past each FAIL: a PASS there is an "island"
         for (int k = 1; k <= cfg_.probeBeyond; ++k) {
             if (s.hiFail && *s.hiFail + k <= cfg_.rangeHi && !tested(*s.hiFail + k)) return *s.hiFail + k;

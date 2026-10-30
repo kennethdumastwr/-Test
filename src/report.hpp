@@ -52,6 +52,7 @@ inline void addLine(std::string& out, const ReportStyle& st, const char* tag, co
 
 // "[-2,+2] 5F"  /  "[-8R,+3] 12F"   (letter after a number = edge was NOT a FAIL, see legend)
 inline std::string windowText(const WindowResult& w) {
+    if (w.capped) return std::to_string(w.capWidth) + "+F";
     auto side = [](int v, Limit l, bool plus) {
         std::string s = (plus && v >= 0) ? "+" : "";
         s += std::to_string(v);
@@ -68,6 +69,7 @@ inline std::string flagsText(const GroupReport& g) {
     if (g.w.drift) f.push_back("DRIFT");
     if (g.w.island) f.push_back("ISLAND");
     if (g.horizonCapped) f.push_back("HORIZON-CAPPED");
+    if (g.cpFallback) f.push_back("CP-FALLBACK");
     if (f.empty()) return "stable";
     std::string s;
     for (size_t i = 0; i < f.size(); ++i) s += (i ? " " : "") + f[i];
@@ -93,8 +95,8 @@ inline std::string formatLine(const GroupSet& gs, const GroupReport& g, const Re
     }
     if (g.w.baseFailed) { tag = "cr"; return head + "  original timing does not pass"; }
     const double ms = g.w.width() * 1000.0 / st.tps;
-    std::string line = head + "  " + windowText(g.w) + " " + fmt("%.1f", ms) + "ms  " + flagsText(g);
-    const bool clean = !g.w.unstable && !g.w.drift && !g.w.island && g.w.clipLo == Limit::None && g.w.clipHi == Limit::None;
+    std::string line = head + "  " + windowText(g.w) + " " + fmt("%.1f", ms) + (g.w.capped ? "ms+  " : "ms  ") + flagsText(g);
+    const bool clean = !g.w.unstable && !g.w.drift && !g.w.island && g.w.clipLo == Limit::None && (g.w.clipHi == Limit::None || g.w.capped);
     tag = clean ? "cg" : ((g.w.unstable || g.w.drift) ? "cr" : "co");
     return line;
 }
@@ -118,6 +120,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
         } else if (r.refCompleted) addLine(out, st, nullptr, "reference run: completed the level");
         else if (r.refTimedOut) addLine(out, st, "co", "reference run hit the time limit");
         else addLine(out, st, nullptr, "reference run: survived " + std::to_string(r.refTicks) + " ticks");
+        addLine(out, st, nullptr, std::string("checkpoints: ") + (r.usedCheckpoints ? "used (fast mode)" : "not used (levels restart from the start)"));
     }
     for (const std::string& w : m.warnings) addLine(out, st, "co", "note: " + w);
     {
@@ -145,7 +148,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
         if (noop) sum += ", " + std::to_string(noop) + " no-op";
         addLine(out, st, (unreached || basefail || drift || unstable || unmappable) ? "co" : "cg", sum);
     }
-    addLine(out, st, nullptr, "Edge letters: R radius, N neighbour input, S start, E end of reference, P x flat. A letter means no FAIL was found before that limit.");
+    addLine(out, st, nullptr, "Edge letters: R radius, N neighbour input, S start, E end of reference, P x flat. A letter means no FAIL was found before that limit. 10+ = at least that wide, not measured further.");
     out += "\n";
     for (const GroupReport& g : r.groups) {
         if (g.state == GroupState::NotSelected) continue;

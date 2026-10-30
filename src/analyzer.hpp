@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <climits>
 #include <memory>
+#include <set>
 #include <optional>
 #include <string>
 #include <vector>
@@ -37,6 +38,8 @@ struct AnalyzerSettings {
     double epsilon = 0.001;     // x tolerance used by playback
     int onlyAction = 0;         // 1-based action number, 0 = every input
     int maxRunTicks = 240 * 180;  // hard stop for one run
+    int maxWidth = 10;          // a window this wide is reported as "10+" and the next input is analysed (0 = off)
+    bool useCheckpoints = true; // start each trial from a checkpoint taken at the previous input (needs the game side to support it)
 };
 
 struct TrialSpec {
@@ -45,6 +48,8 @@ struct TrialSpec {
     int stopAfterLastFire = -1;        // reference: stop N ticks after the last input fired (-1 = off)
     int maxTick = 0;                   // safety stop
     bool recordX = false;              // record the pre-step x of every tick
+    bool captureCheckpoints = false;   // reference: take a checkpoint at the END of every tick in which inputs fired
+    int checkpointTick = -1;           // trial: start from the checkpoint taken at the end of this tick (ticks stay absolute)
 };
 
 struct TrialResult {
@@ -58,6 +63,7 @@ struct TrialResult {
     int ticksRun = 0;         // number of ticks executed (tick indices 0..ticksRun-1)
     std::vector<int> firedTick;  // per position in TrialSpec::actions, -1 = never fired
     std::vector<double> xs;      // only if recordX: xs[t] = x before tick t
+    std::vector<int> checkpointTicks;  // ticks a checkpoint was actually captured for
     std::vector<double> ys;      // only if recordX: ys[t] = y before tick t (used to place the on-screen markers)
 };
 
@@ -75,6 +81,8 @@ struct GroupReport {
     int refTick = -1;
     int endTick = -1;
     bool horizonCapped = false;
+    bool usedCheckpoint = false;  // trials started from a checkpoint
+    bool cpFallback = false;      // the checkpoint run did not reproduce the original timing, re-measured from the level start
     WindowResult w;
 };
 
@@ -88,6 +96,7 @@ struct Report {
     std::string refDeathNote;
     bool refCompleted = false;
     bool refTimedOut = false;
+    bool usedCheckpoints = false;
     std::string note;  // top-level problem, empty if none
     int totalTrials = 0;
     bool cancelled = false;
@@ -153,6 +162,7 @@ public:
                 TrialSpec t;
                 t.actions = macro_.actions;
                 t.recordX = true;
+                t.captureCheckpoints = s_.useCheckpoints;
                 t.stopAfterLastFire = std::max(s_.horizonMinTicks, s_.radius) + 12;
                 t.maxTick = s_.maxRunTicks;
                 pendingSpec_ = t;
@@ -172,7 +182,17 @@ public:
                 continue;
             }
             std::optional<int> off = cur_->search.next();
-            if (!off) { finalizeGroup(); continue; }
+            if (!off) {
+                if (cur_->usingCp && cur_->search.result().baseFailed) {
+                    // the checkpoint run did not reproduce the original timing: measure this input from the level start instead
+                    cur_->usingCp = false;
+                    cur_->fellBack = true;
+                    cur_->search = WindowSearch(cur_->cfg);
+                    continue;
+                }
+                finalizeGroup();
+                continue;
+            }
             pendingOffset_ = *off;
             pendingSpec_ = buildTrial(*off);
             stage_ = Stage::WaitTrial;
@@ -198,8 +218,13 @@ private:
         int refTick = 0;
         int endTick = 0;
         bool capped = false;
+        int cpTick = -1;
+        bool usingCp = false;
+        bool fellBack = false;
+        SearchConfig cfg;
         WindowSearch search;
-        Current(int g, int t, int e, bool c, const SearchConfig& cfg) : group(g), refTick(t), endTick(e), capped(c), search(cfg) {}
+        Current(int g, int t, int e, bool c, int cp, const SearchConfig& config)
+            : group(g), refTick(t), endTick(e), capped(c), cpTick(cp), usingCp(cp >= 0), cfg(config), search(config) {}
     };
 
     bool isNoOp(int gi) const { return gs_.groups[gi].kind == GroupKind::NoOp; }
@@ -213,6 +238,9 @@ private:
         report_.refDeathNote = r.deathNote;
         report_.refCompleted = r.completed;
         report_.refTimedOut = r.timedOut;
+        cpTicks_.clear();
+        for (int t : r.checkpointTicks) cpTicks_.insert(t);
+        report_.usedCheckpoints = s_.useCheckpoints && !cpTicks_.empty();
         xs_ = r.xs;
         ys_ = r.ys;
         refDeath_ = r.died ? r.deathTick : -1;
@@ -279,6 +307,7 @@ private:
         cfg.thorough = s_.thorough;
         cfg.probeBeyond = std::max(0, s_.probeBeyond);
         cfg.verify = s_.verify;
+        cfg.maxWidth = s_.thorough ? 0 : std::max(0, s_.maxWidth);
 
         // ---- range, clipped by neighbours / start / end of data
         const int prevT = neighbourTick(gi, -1);
@@ -336,7 +365,8 @@ private:
         rep.y = (T < static_cast<int>(ys_.size())) ? ys_[T] : 0.0;
         rep.endTick = end;
         rep.horizonCapped = capped;
-        cur_ = std::make_unique<Current>(gi, T, end, capped, cfg);
+        const int cpTick = (s_.useCheckpoints && prevT >= 0 && cpTicks_.count(prevT)) ? prevT : -1;
+        cur_ = std::make_unique<Current>(gi, T, end, capped, cpTick, cfg);
     }
 
     void finalizeGroup() {
@@ -345,6 +375,8 @@ private:
         rep.refTick = cur_->refTick;
         rep.endTick = cur_->endTick;
         rep.horizonCapped = cur_->capped;
+        rep.usedCheckpoint = cur_->cpTick >= 0 && !cur_->fellBack;
+        rep.cpFallback = cur_->fellBack;
         cur_.reset();
     }
 
@@ -360,6 +392,7 @@ private:
         }
         t.endTick = cur_->endTick;
         t.maxTick = cur_->endTick + 16;
+        t.checkpointTick = cur_->usingCp ? cur_->cpTick : -1;
         t.recordX = false;
         return t;
     }
@@ -386,6 +419,7 @@ private:
     GroupSet gs_;
     Report report_;
     Stage stage_ = Stage::NeedReference;
+    std::set<int> cpTicks_;
     std::vector<double> xs_, ys_;
     std::vector<int> refFire_;
     int refDeath_ = -1;
