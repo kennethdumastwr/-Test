@@ -20,7 +20,7 @@
       "name": "Scan radius (ticks)",
       "description": "Maximum ticks tested on each side of the recorded input.",
       "type": "int",
-      "default": 8,
+      "default": 10,
       "min": 1,
       "max": 40,
       "control": {
@@ -37,7 +37,7 @@
       "name": "Probe beyond first fail",
       "description": "Extra offsets tested past the first fail on each side to detect islands (ignored in thorough mode).",
       "type": "int",
-      "default": 1,
+      "default": 0,
       "min": 0,
       "max": 6,
       "control": {
@@ -48,7 +48,7 @@
       "name": "Verify boundaries",
       "description": "Run each boundary offset twice. A disagreement shrinks the window and marks it UNSTABLE.",
       "type": "bool",
-      "default": true
+      "default": false
     },
     "only-action": {
       "name": "Only action #",
@@ -165,6 +165,22 @@
     "settings-button": {
       "name": "Settings button",
       "description": "Adds a FW Settings button to the pause menu.",
+      "type": "bool",
+      "default": true
+    },
+    "overlay-section": {
+      "name": "Window markers",
+      "type": "title"
+    },
+    "show-overlay": {
+      "name": "Show windows in level",
+      "description": "Shows the saved window width above every analysed click (also toggled by the Show Windows pause button). Needs a saved analysis of the selected macro.",
+      "type": "bool",
+      "default": false
+    },
+    "overlay-hud": {
+      "name": "Counter",
+      "description": "Show the 1 / 2 / 3 / 4 / 5+ counter in the top-left corner.",
       "type": "bool",
       "default": true
     }
