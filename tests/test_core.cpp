@@ -217,6 +217,8 @@ struct FakeLevel {
     mutable int flakeBudget = 1;
     int killAtTick = -1;            // reference dies here regardless
     int trials = 0;
+    bool cpArtifact = false;        // simulate a checkpoint restore that does NOT reproduce the original timing
+    mutable long long ticksSimulated = 0;
 };
 
 static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
@@ -229,13 +231,22 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
     for (auto& a : spec.actions) maxId = std::max(maxId, a.id);
     std::vector<int> posOfId(maxId + 1, -1);
     for (size_t i = 0; i < spec.actions.size(); ++i) posOfId[spec.actions[i].id] = static_cast<int>(i);
+    const int t0 = spec.checkpointTick >= 0 ? spec.checkpointTick + 1 : 0;   // state restored at the end of that tick
     std::multimap<int, int> lateCheck;  // tick -> rule id that must have fired by then
-    for (auto& kv : lv.rules) lateCheck.insert({kv.second.B + 1, kv.first});
+    for (auto& kv : lv.rules) {
+        const int pos = kv.first <= maxId ? posOfId[kv.first] : -1;
+        // an input that already fired before the restored checkpoint was satisfied in the run that made the checkpoint
+        const bool before = pos >= 0 && spec.actions[pos].x < t0 * lv.speed - 0.5 * lv.speed;
+        if (!before && kv.second.B + 1 > t0) lateCheck.insert({kv.second.B + 1, kv.first});
+    }
 
-    int deathAt = INT_MAX;
+    int deathAt = lv.cpArtifact && spec.checkpointTick >= 0 ? t0 : INT_MAX;
     std::vector<Fire> fires;
     int lastFire = 0;
-    for (int t = 0;; ++t) {
+    if (t0 > 0) cur.seekTo(t0 * lv.speed, fires);
+    fires.clear();
+    for (int t = t0;; ++t) {
+        ++lv.ticksSimulated;
         if (t >= spec.maxTick) { r.timedOut = true; r.ticksRun = t; break; }
         const double x = t * lv.speed;
         if (spec.recordX) { r.xs.push_back(x); r.ys.push_back(105.0); }
@@ -259,6 +270,7 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
             break;
         }
         r.ticksRun = t + 1;
+        if (spec.captureCheckpoints && !fires.empty()) r.checkpointTicks.push_back(t);
         if (spec.endTick >= 0 && t >= spec.endTick) break;
         if (spec.stopAfterLastFire >= 0 && cur.done() && t >= lastFire + spec.stopAfterLastFire) break;
     }
@@ -309,6 +321,8 @@ static void testAnalyzer() {
     SECTION("analyzer end-to-end on the fake game");
     AnalyzerSettings st;
     st.radius = 8;
+    st.maxWidth = 0;          // these older checks measure the full window
+    st.useCheckpoints = false;
     Analyzer a(m, st);
     int trials = 0;
     drive(&a, lv, &trials);
@@ -362,9 +376,9 @@ static void testAnalyzer() {
         MacroFile m2 = parseMacro(macroText({{100, 1, 0}, {400, 0, 0}}));
         FakeLevel lv2;
         lv2.rules[0] = {98, 100, 30};  // pressing early kills 30 ticks later
-        AnalyzerSettings sShort; sShort.radius = 8; sShort.horizonMinTicks = 10; sShort.horizonGroups = 0;
+        AnalyzerSettings sShort; sShort.radius = 8; sShort.maxWidth = 0; sShort.useCheckpoints = false; sShort.horizonMinTicks = 10; sShort.horizonGroups = 0;
         Analyzer a1(m2, sShort); drive(&a1, lv2);
-        AnalyzerSettings sLong; sLong.radius = 8; sLong.horizonMinTicks = 60; sLong.horizonGroups = 0;
+        AnalyzerSettings sLong; sLong.radius = 8; sLong.maxWidth = 0; sLong.useCheckpoints = false; sLong.horizonMinTicks = 60; sLong.horizonGroups = 0;
         Analyzer a2(m2, sLong); drive(&a2, lv2);
         const GroupReport* s1 = byNumber(a1, 1); const GroupReport* s2 = byNumber(a2, 1);
         CHECK(s1 && s2);
@@ -470,6 +484,74 @@ static void testRealMacroSmoke() {
     CHECK(!a.report().refDied);
 }
 
+static void testCapAndCheckpoints() {
+    SECTION("window: width cap stops early and reports N+");
+    {
+        SearchConfig c; c.rangeLo = -20; c.rangeHi = 20; c.maxWidth = 10; c.verify = false; c.probeBeyond = 0;
+        std::vector<int> order;
+        auto r = runSearch(c, [](int) { return Verdict::Pass; }, &order);
+        CHECK(r.capped && r.width() == 10 && r.clipHi == Limit::Cap);
+        CHECK(order.size() <= 12);                               // 0 plus about 10 offsets, not 41
+        auto narrow = runSearch(c, window(-2, 2));
+        CHECK(!narrow.capped && narrow.width() == 5);            // narrow windows are still measured exactly
+        c.maxWidth = 0;
+        CHECK(!runSearch(c, [](int) { return Verdict::Pass; }).capped);
+        CHECK(windowText(r) == "10+F");
+    }
+
+    SECTION("analyzer: 10+ and moving on");
+    {
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {200, 0, 0}, {300, 1, 0}}));
+        FakeLevel lv;
+        lv.rules[0] = {80, 125, 0};   // 46 ticks wide
+        lv.rules[1] = {198, 202, 0};
+        AnalyzerSettings st; st.radius = 20; st.useCheckpoints = false;   // maxWidth 10 is the default
+        Analyzer a(m, st); int n = 0; drive(&a, lv, &n);
+        auto g0 = byNumber(a, 1); auto g1 = byNumber(a, 2);
+        CHECK(g0 && g0->w.capped && g0->w.width() == 10);
+        CHECK(g1 && !g1->w.capped && g1->w.lo == -2 && g1->w.hi == 2);
+        const char* tagDummy = nullptr;
+        CHECK(formatLine(a.groups(), *g0, ReportStyle{}, tagDummy).find("10+F") != std::string::npos);
+        std::printf("  trials with cap: %d\n", n);
+    }
+
+    SECTION("checkpoints: same windows, far fewer ticks simulated");
+    {
+        std::vector<std::tuple<int, int, int>> ev;
+        FakeLevel lv;
+        for (int i = 0; i < 12; ++i) { ev.push_back({200 + i * 120, 1, 0}); ev.push_back({240 + i * 120, 0, 0}); }
+        for (int i = 0; i < 12; ++i) { lv.rules[2 * i] = {198 + i * 120, 202 + i * 120, 0}; lv.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0}; }
+        MacroFile m = parseMacro(macroText(ev));
+        AnalyzerSettings off; off.useCheckpoints = false; off.maxWidth = 0;
+        AnalyzerSettings on = off; on.useCheckpoints = true;
+        Analyzer a0(m, off); lv.ticksSimulated = 0; drive(&a0, lv); long long ticksOff = lv.ticksSimulated;
+        Analyzer a1(m, on);  lv.ticksSimulated = 0; drive(&a1, lv); long long ticksOn = lv.ticksSimulated;
+        std::printf("  ticks simulated: from start %lld, with checkpoints %lld (%.1fx less)\n", ticksOff, ticksOn, double(ticksOff) / double(ticksOn));
+        CHECK(ticksOn * 3 < ticksOff);
+        CHECK(a1.report().usedCheckpoints);
+        bool same = true;
+        for (size_t i = 0; i < a0.report().groups.size(); ++i) {
+            const auto& x = a0.report().groups[i]; const auto& y = a1.report().groups[i];
+            if (x.state != y.state || x.w.lo != y.w.lo || x.w.hi != y.w.hi || y.cpFallback) same = false;
+        }
+        CHECK(same);
+        CHECK(!a1.report().groups[0].usedCheckpoint && a1.report().groups[5].usedCheckpoint);   // first input has nothing before it
+
+        SECTION("checkpoints: a restore that does not reproduce the original timing falls back to the level start");
+        FakeLevel bad = lv; bad.cpArtifact = true;
+        Analyzer a2(m, on); drive(&a2, bad);
+        bool allOk = true; int fallbacks = 0;
+        for (size_t i = 0; i < a0.report().groups.size(); ++i) {
+            const auto& x = a0.report().groups[i]; const auto& y = a2.report().groups[i];
+            if (x.state != y.state || x.w.lo != y.w.lo || x.w.hi != y.w.hi) allOk = false;
+            fallbacks += y.cpFallback;
+        }
+        CHECK(allOk);
+        CHECK(fallbacks == 23);   // every input except the first one tried the checkpoint, failed the base run, and was re-measured
+        CHECK(flagsText(a2.report().groups[5]).find("CP-FALLBACK") != std::string::npos);
+    }
+}
+
 static void testSeekAndOld() {
     SECTION("cursor: seekTo after respawn restores a held button");
     std::vector<MacroAction> v(4);
@@ -514,6 +596,7 @@ static void testWrap() {
 }
 
 int main() {
+    testCapAndCheckpoints();
     testSeekAndOld();
     testWrap();
     testParser();
