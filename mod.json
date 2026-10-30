@@ -172,15 +172,9 @@
       "name": "Window markers",
       "type": "title"
     },
-    "show-overlay": {
-      "name": "Show windows in level",
-      "description": "Shows the saved window width above every analysed click (also toggled by the Show Windows pause button). Needs a saved analysis of the selected macro.",
-      "type": "bool",
-      "default": false
-    },
     "overlay-hud": {
       "name": "Counter",
-      "description": "Show the 1 / 2 / 3 / 4 / 5+ counter in the top-left corner.",
+      "description": "Show the 1 / 2 / 3 / 4 / 5+ counter in the top-left corner while windows are shown.",
       "type": "bool",
       "default": true
     }
