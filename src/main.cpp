@@ -58,6 +58,7 @@ namespace {
         double expectedTps = 240.0;
         bool saveReport = true;
         int ignoreEarlyTicks = 0;
+        std::string probe;           // x/y of the first ticks of a reference run (shown if the run dies early)
 
         Ref<CCLabelBMFont> label;
         std::string pendingTitle, pendingText;  // popup to show on the next frame
@@ -241,6 +242,7 @@ namespace {
         g.tick = 0;
         g.lastFire = -1;
         g.idleCalls = 0;
+        g.probe.clear();
         g.trialActive = true;
 
         g.resettingByUs = true;
@@ -360,7 +362,13 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             return;
         }
         const double x = playerX(m_player1);
-        if (g.spec.recordX) g.res.xs.push_back(x);
+        if (g.spec.recordX) {
+            g.res.xs.push_back(x);
+            if (g.tick < 8) {
+                g.probe += "t" + std::to_string(g.tick) + " x=" + fw::fmt("%.2f", x) + " y=" +
+                           fw::fmt("%.1f", m_player1 ? static_cast<double>(m_player1->getPositionY()) : 0.0) + "; ";
+            }
+        }
 
         std::vector<fw::Fire> fires;
         g.cursor.poll(x, fires);
@@ -429,9 +437,14 @@ class $modify(FWPlayLayer, PlayLayer) {
                 g.res.died = true;
                 g.res.deathTick = g.tick;  // tick in progress (g.tick is incremented after processCommands)
                 g.res.deathX = playerX(player);
-                g.res.deathNote = (obj ? "object id " + std::to_string(obj->m_objectID) : std::string("no object (out of bounds / script)")) +
-                                  ", player y=" + fw::fmt("%.1f", player ? static_cast<double>(player->getPositionY()) : 0.0) +
-                                  (player == this->m_player2 ? " (P2)" : "");
+                std::string where = "no object (out of bounds / script)";
+                if (obj) {
+                    where = "object id " + std::to_string(obj->m_objectID) + " at (" + fw::fmt("%.1f", static_cast<double>(obj->getPositionX())) +
+                            "," + fw::fmt("%.1f", static_cast<double>(obj->getPositionY())) + ")";
+                }
+                g.res.deathNote = where + ", player at (" + fw::fmt("%.1f", playerX(player)) + "," +
+                                  fw::fmt("%.1f", player ? static_cast<double>(player->getPositionY()) : 0.0) + ")" +
+                                  (player == this->m_player2 ? " P2" : "") + (g.probe.empty() ? "" : " | first ticks: " + g.probe);
             }
             return;  // no explosion, no death screen, no respawn
         }
