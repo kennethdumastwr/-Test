@@ -470,6 +470,33 @@ static void testRealMacroSmoke() {
     CHECK(!a.report().refDied);
 }
 
+static void testSeekAndOld() {
+    SECTION("cursor: seekTo after respawn restores a held button");
+    std::vector<MacroAction> v(4);
+    v[0].x = 100; v[0].down = true;
+    v[1].x = 200; v[1].down = false;
+    v[2].x = 300; v[2].down = true;  v[2].p2 = true;
+    v[3].x = 400; v[3].down = false; v[3].p2 = true;
+    Cursor c; c.bind(&v, 0.001);
+    std::vector<Fire> out;
+    c.seekTo(0.0, out);   CHECK(out.empty() && c.next() == 0);              // start of level
+    out.clear(); c.seekTo(150.0, out);
+    CHECK(c.next() == 1 && out.size() == 1 && out[0].down && !out[0].p2);   // was holding P1 -> press again
+    out.clear(); c.seekTo(250.0, out);
+    CHECK(c.next() == 2 && out.empty());                                     // P1 released at 200
+    out.clear(); c.seekTo(350.0, out);
+    CHECK(c.next() == 3 && out.size() == 1 && out[0].p2);                    // P2 held
+    out.clear(); c.seekTo(200.0, out);
+    CHECK(c.next() == 1);                                                    // action exactly at the position is NOT skipped
+    out.clear(); c.seekTo(9999.0, out);
+    CHECK(c.done() && out.empty());
+
+    SECTION("overlay: results from an old version are detected");
+    SavedResults o = parseResultsCsv("numbers,player,kind,x,state,lo,hi,width_ticks,width_ms,clip_lo,clip_hi,flags,trials\n2,P1,press,129.8,analyzed,-2,3,6,25.0,,,stable,9\n");
+    CHECK(o.oldFormat && o.items.empty());
+    CHECK(averageWidth({}) == 0.0);
+}
+
 static void testWrap() {
     SECTION("report: wrapping keeps one colour tag per line");
     auto l = wrapLine("aaaa bbbb cccc dddd eeee", 10);
@@ -487,6 +514,7 @@ static void testWrap() {
 }
 
 int main() {
+    testSeekAndOld();
     testWrap();
     testParser();
     testGroups();
