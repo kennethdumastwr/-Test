@@ -146,7 +146,20 @@ namespace {
         FLAlertLayer::create(title, text, "OK")->show();
     }
 
-    // ---------------------------------------------------------------- on-level window markers (saved results)
+    // ---------------------------------------------------------------- saved results, window markers, playback
+
+    // 0 = off, 1 = show windows, 2 = show windows AND play the macro (saved, so it survives restarts)
+    int windowsMode() { return Mod::get()->getSavedValue<int>("fw-mode", 0); }
+    void setWindowsMode(int m) {
+        Mod::get()->setSavedValue<int>("fw-mode", m);
+        ++g.overlayRevision;
+    }
+    fs::path resultsDir() { return fs::path(Mod::get()->getSaveDir()) / "results"; }
+    fs::path resultsCsv(const std::string& macro) { return resultsDir() / (fs::path(macro).stem().string() + ".windows.csv"); }
+
+    void toast(const std::string& text, NotificationIcon icon = NotificationIcon::Success) {
+        Notification::create(text, icon, 2.5f)->show();
+    }
 
     struct OverlayState {
         Ref<CCNode> world;  // number above every analysed click, scrolls with the level
@@ -164,7 +177,7 @@ namespace {
 
     void refreshOverlay(PlayLayer* pl) {
         auto mod = Mod::get();
-        const bool want = mod->getSettingValue<bool>("show-overlay") && g.phase == Phase::Idle;
+        const bool want = windowsMode() >= 1 && g.phase == Phase::Idle;
         if (!want) {
             if (ov.world || ov.hud || !ov.key.empty()) clearOverlay();
             return;
@@ -174,16 +187,24 @@ namespace {
         if (ov.key == key && (!ov.world || ov.world->getParent() == pl->m_objectLayer)) return;
 
         clearOverlay();
-        ov.key = key;  // remembered even when nothing loads, so a missing file is not retried every frame
+        ov.key = key;  // remembered even when nothing loads, so the message below is shown once, not every frame
         if (macro.empty()) return;
 
-        fs::path csv = fs::path(mod->getSaveDir()) / "results" / (fs::path(macro).stem().string() + ".windows.csv");
         std::string raw;
-        if (!readFile(csv, raw)) return;
+        if (!readFile(resultsCsv(macro), raw)) {
+            toast("No saved windows for " + macro + " - open Frame Window and press Analyze", NotificationIcon::Warning);
+            return;
+        }
         fw::SavedResults sr = fw::parseResultsCsv(raw);
-        if (sr.items.empty()) return;
+        if (sr.items.empty()) {
+            toast(sr.oldFormat ? "Saved windows of " + macro + " are from an old version - Analyze again"
+                               : "Saved windows of " + macro + " are empty - Analyze again",
+                  NotificationIcon::Warning);
+            return;
+        }
         const std::string playing = std::string(pl->m_level->m_levelName);
-        if (!sr.level.empty() && lower(sr.level) != lower(playing)) return;  // results belong to another level
+        if (!sr.level.empty() && lower(sr.level) != lower(playing))
+            toast("Windows were analysed on level \"" + sr.level + "\" (you are on \"" + playing + "\")", NotificationIcon::Warning);
 
         auto world = CCNode::create();
         for (const fw::OverlayItem& it : sr.items) {
@@ -215,6 +236,57 @@ namespace {
             pl->addChild(hud, 1000);
             ov.hud = hud;
         }
+    }
+
+    // ---- playback: run the selected macro by position in normal play (mode 2)
+    struct Playback {
+        bool active = false;
+        std::string key;
+        std::vector<fw::MacroAction> actions;
+        fw::Cursor cursor;
+    } pb;
+
+    void injectFires(GJBaseGameLayer* layer, const std::vector<fw::Fire>& fires) {
+        g.injecting = true;
+        for (const fw::Fire& f : fires) layer->handleButton(f.down, static_cast<int>(PlayerButton::Jump), !f.p2);
+        g.injecting = false;
+    }
+
+    // after a respawn / restart / late start: continue from the player's position (re-presses if mid-hold)
+    void seekPlayback(PlayLayer* pl) {
+        std::vector<fw::Fire> fires;
+        pb.cursor.seekTo(playerX(pl->m_player1), fires);
+        injectFires(pl, fires);
+    }
+
+    void refreshPlayback(PlayLayer* pl) {
+        auto mod = Mod::get();
+        const std::string macro = mod->getSavedValue<std::string>("selected-macro", "");
+        const bool want = windowsMode() == 2 && g.phase == Phase::Idle && !macro.empty();
+        if (!want) {
+            pb.active = false;
+            pb.key.clear();
+            return;
+        }
+        if (pb.key == macro) return;  // loaded (or failed once) already
+        pb.key = macro;
+        pb.active = false;
+
+        std::string raw;
+        if (!readFile(resolveMacrosDir() / macro, raw)) {
+            toast("Cannot read macro " + macro, NotificationIcon::Error);
+            return;
+        }
+        fw::MacroFile mf = fw::parseMacro(raw);
+        if (!mf.ok()) {
+            toast("Macro " + macro + " has errors (line " + std::to_string(mf.errors.empty() ? 0 : mf.errors[0].line) + ")", NotificationIcon::Error);
+            return;
+        }
+        pb.actions = mf.actions;
+        pb.cursor.bind(&pb.actions, mod->getSettingValue<double>("x-epsilon"));
+        pb.active = true;
+        seekPlayback(pl);
+        toast("Playing macro " + macro);
     }
 
     // ---------------------------------------------------------------- progress label
@@ -361,43 +433,38 @@ namespace {
 
     void startAnalysis(PauseLayer* pause, const std::string& fileName);
 
-    void openPicker(PauseLayer* pause) {
-        fs::path dir = resolveMacrosDir();
-        std::vector<std::string> files = listMacros(dir);
+    struct MenuEntry {
+        std::string name;
+        int clicks = 0;
+        double avg = 0.0;
+        bool hasResults = false;  // current-format results with at least one click
+        bool oldFormat = false;   // results from an older version (no y column)
+        bool canDelete() const { return hasResults || oldFormat; }
+    };
 
-        if (files.empty()) {
-            showInfo("Frame Window", "No .txt macros found in:\n" + dir.string() +
-                                         "\n\nRecord one with percent-macro, or set Macros folder in this mod's settings.");
-            return;
-        }
-        std::string sel = Mod::get()->getSavedValue<std::string>("selected-macro", "");
-        size_t idx = 0;
-        for (size_t i = 0; i < files.size(); ++i) if (files[i] == sel) idx = i;
+    struct MenuState {
+        Ref<FLAlertLayer> alert;
+        std::vector<MenuEntry> entries;
+        std::vector<Ref<CCNode>> nodes;
+        int page = 0;
+    } mn;
 
-        // Keep this popup SHORT (4-5 lines): a tall one pushes the buttons off small screens.
-        std::string text = "<cg>" + files[idx] + "</c>  (" + std::to_string(idx + 1) + "/" + std::to_string(files.size()) + ")\n";
-        if (files.size() > 1) text += "next: " + files[(idx + 1) % files.size()] + "\n";
-        if (auto pl = PlayLayer::get()) {
+    std::vector<MenuEntry> loadMenuEntries() {
+        std::vector<MenuEntry> out;
+        for (const std::string& name : listMacros(resolveMacrosDir())) {
+            MenuEntry e;
+            e.name = name;
             std::string raw;
-            if (readFile(dir / files[idx], raw)) {
-                fw::MacroFile mf = fw::parseMacro(raw);
-                std::string playing = std::string(pl->m_level->m_levelName);
-                if (!mf.levelName.empty() && lower(mf.levelName) != lower(playing))
-                    text += "<cr>recorded on " + mf.levelName + ", playing " + playing + "</c>\n";
+            if (readFile(resultsCsv(name), raw)) {
+                fw::SavedResults sr = fw::parseResultsCsv(raw);
+                e.oldFormat = sr.oldFormat && sr.items.empty();
+                e.hasResults = !sr.items.empty();
+                e.clicks = static_cast<int>(sr.items.size());
+                e.avg = fw::averageWidth(sr.items);
             }
+            out.push_back(e);
         }
-        text += "<co>Restarts the level many times - use a copy.</c>";
-
-        Ref<PauseLayer> ref = pause;
-        createQuickPopup("Frame Window", text, "Next file", "Analyze", [ref, files, idx](FLAlertLayer*, bool analyze) {
-            if (!analyze) {
-                Mod::get()->setSavedValue<std::string>("selected-macro", files[(idx + 1) % files.size()]);
-                openPicker(ref);
-            } else {
-                Mod::get()->setSavedValue<std::string>("selected-macro", files[idx]);
-                startAnalysis(ref, files[idx]);
-            }
-        });
+        return out;
     }
 
     void startAnalysis(PauseLayer* pause, const std::string& fileName) {
@@ -441,7 +508,16 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
     // 2.2081 signature: (dt, isHalfTick, isLastTick). Half ticks are not physics ticks of the macro's 240 TPS,
     // so they pass straight through; if the report says the game ran at ~480 ticks/s, flip this condition.
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (isHalfTick || !g.trialActive || static_cast<GJBaseGameLayer*>(PlayLayer::get()) != this) {
+        if (isHalfTick || static_cast<GJBaseGameLayer*>(PlayLayer::get()) != this) {
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            return;
+        }
+        if (!g.trialActive) {
+            if (pb.active) {  // normal play with the macro running by position
+                std::vector<fw::Fire> fires;
+                pb.cursor.poll(playerX(m_player1), fires);
+                if (!fires.empty()) injectFires(this, fires);
+            }
             GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
@@ -491,6 +567,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             FLAlertLayer::create(nullptr, title.c_str(), text, "Close", nullptr, 420.f, true, 250.f, 0.65f)->show();
         }
         refreshOverlay(pl);
+        refreshPlayback(pl);
         if (g.phase != Phase::Running || !g.analyzer) {
             GJBaseGameLayer::update(dt);
             return;
@@ -561,6 +638,7 @@ class $modify(FWPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
         if (g.trialActive && !g.resettingByUs) g.res.aborted = true;  // the game restarted by itself: run is meaningless
+        if (pb.active && !g.trialActive) seekPlayback(this);          // respawn / restart: continue from where the player is
     }
 
     void pauseGame(bool b) {
@@ -571,11 +649,13 @@ class $modify(FWPlayLayer, PlayLayer) {
     void onQuit() {
         if (g.phase == Phase::Running) endSession(nullptr, false, false);
         clearOverlay();
+        pb.active = false;
+        pb.key.clear();
         PlayLayer::onQuit();
     }
 };
 
-// ------------------------------------------------------------------ pause menu buttons
+// ------------------------------------------------------------------ pause menu: button + the macro/windows menu
 class $modify(FWPause, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
@@ -588,16 +668,6 @@ class $modify(FWPause, PauseLayer) {
         menu->setPosition({78.f, 56.f});
         this->addChild(menu);
 
-        {
-            auto spr3 = ButtonSprite::create("Show Windows");
-            spr3->setScale(0.6f);
-            auto btn3 = CCMenuItemSpriteExtra::create(spr3, this, menu_selector(FWPause::onToggleWindows));
-            auto menu3 = CCMenu::create();
-            menu3->addChild(btn3);
-            menu3->setPosition({78.f, 88.f});
-            this->addChild(menu3);
-        }
-
         if (Mod::get()->getSettingValue<bool>("settings-button")) {
             auto spr2 = ButtonSprite::create("FW Settings");
             spr2->setScale(0.6f);
@@ -609,11 +679,150 @@ class $modify(FWPause, PauseLayer) {
         }
     }
 
-    void onToggleWindows(CCObject*) {
-        const bool now = !Mod::get()->getSettingValue<bool>("show-overlay");
-        Mod::get()->setSettingValue<bool>("show-overlay", now);
-        Notification::create(now ? "Frame windows: ON" : "Frame windows: OFF", NotificationIcon::Success, 1.f)->show();
-    }
-    void onFrameWindow(CCObject*) { openPicker(this); }
     void onFrameWindowSettings(CCObject*) { openSettingsPopup(Mod::get()); }
+
+    void onFrameWindow(CCObject*) {
+        mn.entries = loadMenuEntries();
+        if (mn.entries.empty()) {
+            showInfo("Frame Window", "No .txt macros found in:\n" + resolveMacrosDir().string() +
+                                         "\n\nRecord one with percent-macro, or set Macros folder in this mod's settings.");
+            return;
+        }
+        mn.page = 0;
+        mn.nodes.clear();
+        std::string blank;
+        for (int i = 0; i < 11; ++i) blank += "\n";  // gives the panel its height; the rows are drawn on top
+        FLAlertLayer* alert = FLAlertLayer::create(nullptr, "Frame Windows", blank, "Close", nullptr, 440.f, false, 0.f, 1.f);
+        mn.alert = alert;
+        fwBuildMenu();
+        alert->show();
+    }
+
+    // (re)draw the current page of the list inside the alert
+    void fwBuildMenu() {
+        for (auto& n : mn.nodes) if (n) n->removeFromParent();
+        mn.nodes.clear();
+        FLAlertLayer* alert = mn.alert;
+        if (!alert) return;
+
+        const auto win = CCDirector::sharedDirector()->getWinSize();
+        // positions are given relative to the screen centre and converted into each parent's own space
+        auto at = [&](CCNode* parent, float dx, float dy) { return parent->convertToNodeSpace(ccp(win.width / 2 + dx, win.height / 2 + dy)); };
+        auto label = [&](const std::string& text, const char* font, float scale, float dx, float dy, ccColor3B col, bool left) {
+            auto l = CCLabelBMFont::create(text.c_str(), font);
+            l->setScale(scale);
+            l->setColor(col);
+            if (left) l->setAnchorPoint({0.f, 0.5f});
+            l->setPosition(at(alert->m_mainLayer, dx, dy));
+            alert->m_mainLayer->addChild(l, 10);
+            mn.nodes.push_back(l);
+        };
+        auto button = [&](const char* text, float scale, float dx, float dy, int tag, SEL_MenuHandler handler) {
+            auto spr = ButtonSprite::create(text);
+            spr->setScale(scale);
+            auto b = CCMenuItemSpriteExtra::create(spr, this, handler);
+            b->setTag(tag);
+            b->setPosition(at(alert->m_buttonMenu, dx, dy));
+            alert->m_buttonMenu->addChild(b);
+            mn.nodes.push_back(b);
+        };
+
+        const std::string selected = Mod::get()->getSavedValue<std::string>("selected-macro", "");
+        const int mode = windowsMode();
+        std::string now = mode == 0 ? "off" : (mode == 1 ? "windows shown" : "macro playing + windows");
+        label("Now: " + (selected.empty() ? std::string("-") : selected) + "  [" + now + "]", "bigFont.fnt", 0.3f, 0.f, 100.f, ccc3(255, 255, 255), false);
+
+        const int perPage = 4;
+        const int total = static_cast<int>(mn.entries.size());
+        const int pages = std::max(1, (total + perPage - 1) / perPage);
+        mn.page = std::clamp(mn.page, 0, pages - 1);
+        for (int r = 0; r < perPage; ++r) {
+            const int i = mn.page * perPage + r;
+            if (i >= total) break;
+            const MenuEntry& e = mn.entries[i];
+            const float dy = 68.f - 34.f * r;
+            std::string shown = e.name.size() > 18 ? e.name.substr(0, 16) + ".." : e.name;
+            const bool isSel = e.name == selected && mode > 0;
+            label(shown, "bigFont.fnt", 0.4f, -208.f, dy + 7.f, isSel ? ccc3(110, 255, 110) : ccc3(255, 255, 255), true);
+            std::string st = e.hasResults ? std::to_string(e.clicks) + " clicks, avg " + fw::fmt("%.1f", e.avg) + "F"
+                             : e.oldFormat ? std::string("old results - Analyze again")
+                                           : std::string("not analysed yet");
+            label(st, "chatFont.fnt", 0.5f, -208.f, dy - 8.f, ccc3(170, 200, 255), true);
+            button("Analyze", 0.4f, 8.f, dy, i, menu_selector(FWPause::onMenuAnalyze));
+            button("Show", 0.4f, 70.f, dy, i, menu_selector(FWPause::onMenuShow));
+            button("Play", 0.4f, 116.f, dy, i, menu_selector(FWPause::onMenuPlay));
+            if (e.canDelete()) button("Del", 0.4f, 160.f, dy, i, menu_selector(FWPause::onMenuDelete));
+        }
+
+        label("page " + std::to_string(mn.page + 1) + "/" + std::to_string(pages), "chatFont.fnt", 0.6f, 0.f, -70.f, ccc3(255, 255, 255), false);
+        if (pages > 1) {
+            button("<", 0.45f, -60.f, -70.f, 0, menu_selector(FWPause::onMenuPrev));
+            button(">", 0.45f, 60.f, -70.f, 0, menu_selector(FWPause::onMenuNext));
+        }
+        button("Off", 0.45f, 160.f, -70.f, 0, menu_selector(FWPause::onMenuOff));
+    }
+
+    int fwTag(CCObject* sender) { return static_cast<CCNode*>(sender)->getTag(); }
+
+    void fwCloseMenu() {
+        if (!mn.alert) return;
+        mn.alert->setKeypadEnabled(false);
+        mn.alert->setTouchEnabled(false);
+        mn.alert->removeFromParentAndCleanup(true);
+    }
+
+    void onMenuPrev(CCObject*) { --mn.page; fwBuildMenu(); }
+    void onMenuNext(CCObject*) { ++mn.page; fwBuildMenu(); }
+
+    void onMenuOff(CCObject*) {
+        setWindowsMode(0);
+        toast("Windows / playback: OFF");
+        fwBuildMenu();
+    }
+
+    void onMenuAnalyze(CCObject* sender) {
+        const int i = fwTag(sender);
+        if (i < 0 || i >= static_cast<int>(mn.entries.size())) return;
+        const std::string name = mn.entries[i].name;
+        Mod::get()->setSavedValue<std::string>("selected-macro", name);
+        fwCloseMenu();
+        startAnalysis(this, name);
+    }
+
+    void fwSelect(int i, int mode) {
+        if (i < 0 || i >= static_cast<int>(mn.entries.size())) return;
+        const MenuEntry& e = mn.entries[i];
+        if (!e.hasResults) {
+            toast(e.oldFormat ? e.name + ": old results, press Analyze again" : e.name + ": no windows yet, press Analyze first",
+                  NotificationIcon::Warning);
+            if (mode == 1) return;  // nothing to show; Play still runs the macro without markers
+        }
+        Mod::get()->setSavedValue<std::string>("selected-macro", e.name);
+        pb.key.clear();  // force a reload of the macro
+        setWindowsMode(mode);
+        toast((mode == 2 ? "Playing + windows: " : "Showing windows: ") + e.name + "  (resume the level)");
+        fwBuildMenu();
+    }
+
+    void onMenuShow(CCObject* sender) { fwSelect(fwTag(sender), 1); }
+    void onMenuPlay(CCObject* sender) { fwSelect(fwTag(sender), 2); }
+
+    void onMenuDelete(CCObject* sender) {
+        const int i = fwTag(sender);
+        if (i < 0 || i >= static_cast<int>(mn.entries.size())) return;
+        const std::string name = mn.entries[i].name;
+        createQuickPopup("Delete windows", "Delete the saved windows of <cy>" + name + "</c>?\n(the macro file itself is NOT touched)", "No", "Delete",
+                         [this, name](FLAlertLayer*, bool yes) {
+                             if (!yes) return;
+                             std::error_code ec;
+                             const std::string stem = fs::path(name).stem().string();
+                             fs::remove(resultsDir() / (stem + ".windows.csv"), ec);
+                             fs::remove(resultsDir() / (stem + ".windows.txt"), ec);
+                             if (Mod::get()->getSavedValue<std::string>("selected-macro", "") == name) setWindowsMode(0);
+                             else ++g.overlayRevision;
+                             mn.entries = loadMenuEntries();
+                             toast("Deleted windows of " + name);
+                             fwBuildMenu();
+                         });
+    }
 };

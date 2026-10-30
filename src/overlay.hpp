@@ -19,6 +19,7 @@ struct OverlayItem {
 struct SavedResults {
     std::string level;      // level name stored in the file ("" = unknown)
     std::string macro;
+    bool oldFormat = false;  // written by a version without the y column: analyse again
     std::vector<OverlayItem> items;
 };
 
@@ -46,6 +47,7 @@ inline SavedResults parseResultsCsv(const std::string& text) {
         }
         if (line.rfind("numbers,", 0) == 0) continue;
         auto f = splitCsv(line);
+        if (f.size() >= 5 && f[4] == "analyzed") { r.oldFormat = true; continue; }
         if (f.size() < 12 || f[5] != "analyzed" || f[8].empty()) continue;
         OverlayItem it;
         it.x = std::atof(f[3].c_str());
@@ -77,6 +79,13 @@ inline int widthBucket(int w) { return w < 1 ? 1 : (w > 5 ? 5 : w); }
 inline void histogram(const std::vector<OverlayItem>& items, int out[5]) {
     for (int i = 0; i < 5; ++i) out[i] = 0;
     for (const auto& it : items) ++out[widthBucket(it.width) - 1];
+}
+
+inline double averageWidth(const std::vector<OverlayItem>& items) {
+    if (items.empty()) return 0.0;
+    double sum = 0.0;
+    for (const auto& it : items) sum += it.width;
+    return sum / static_cast<double>(items.size());
 }
 
 inline std::string markerText(const OverlayItem& it) { return std::to_string(it.width) + (it.clipped ? "+" : ""); }

@@ -40,6 +40,20 @@ public:
         }
     }
 
+    // After a respawn / checkpoint / late start: continue from the first action at or after `x`.
+    // If the player was holding at that point, press again right away (appended to `out` with pos = -1).
+    void seekTo(double x, std::vector<Fire>& out) {
+        if (!acts_) return;
+        size_t i = 0;
+        while (i < acts_->size() && (*acts_)[i].x < x - eps_) ++i;
+        next_ = i;
+        bool held[2] = {false, false};
+        for (size_t k = 0; k < i; ++k) held[(*acts_)[k].p2 ? 1 : 0] = (*acts_)[k].down;
+        for (int p = 0; p < 2; ++p) {
+            if (held[p]) out.push_back({-1, true, p == 1});
+        }
+    }
+
 private:
     const std::vector<MacroAction>* acts_ = nullptr;
     double eps_ = 0.001;
