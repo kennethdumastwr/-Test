@@ -134,6 +134,18 @@
         "slider": false
       }
     },
+    "ignore-early-death-ticks": {
+      "name": "Ignore deaths in first N ticks",
+      "description": "Workaround if the untouched macro 'dies' right at the start (spawn glitch). 0 = off. The report says what killed the player.",
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 60,
+      "control": {
+        "input": true,
+        "slider": false
+      }
+    },
     "files-section": {
       "name": "Files",
       "type": "title"
