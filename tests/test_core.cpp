@@ -8,6 +8,7 @@
 
 #include "../src/analyzer.hpp"
 #include "../src/playback.hpp"
+#include "../src/overlay.hpp"
 #include "../src/report.hpp"
 
 using namespace fw;
@@ -237,7 +238,7 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
     for (int t = 0;; ++t) {
         if (t >= spec.maxTick) { r.timedOut = true; r.ticksRun = t; break; }
         const double x = t * lv.speed;
-        if (spec.recordX) r.xs.push_back(x);
+        if (spec.recordX) { r.xs.push_back(x); r.ys.push_back(105.0); }
         fires.clear();
         cur.poll(x, fires);
         for (const Fire& f : fires) {
@@ -336,6 +337,24 @@ static void testAnalyzer() {
         std::printf("%s", txt.c_str());
         CHECK(txt.find("[-2,+3] 6F") != std::string::npos);
         CHECK(formatCsv(a, 240.0).find("analyzed") != std::string::npos);
+        CHECK(txt.find("summary: 6 analysed") != std::string::npos);
+    }
+
+    SECTION("overlay: saved csv -> markers (persistence round trip)");
+    {
+        std::string csv = formatCsv(a, 240.0);
+        SavedResults sr = parseResultsCsv(csv);
+        CHECK(sr.items.size() == 6);
+        CHECK(sr.items[0].width == 6 && sr.items[0].lo == -2 && sr.items[0].hi == 3 && !sr.items[0].clipped);
+        CHECK(std::fabs(sr.items[0].y - 105.0) < 1e-6 && std::fabs(sr.items[0].x - 129.8245) < 0.01);
+        CHECK(sr.items[1].clipped);                       // R@130 hit the radius on the right
+        int h[5]; histogram(sr.items, h);
+        CHECK(h[0] + h[1] + h[2] + h[3] + h[4] == 6);
+        CHECK(widthBucket(12) == 5 && widthBucket(1) == 1 && widthBucket(4) == 4);
+        CHECK(markerText(sr.items[1]).back() == '+');
+        SavedResults lv = parseResultsCsv("# level My Level\n# macro a.txt\nnumbers,player\n3,P1,press,1.0,2.0,analyzed,-1,1,3,12.5,,,stable,7\n4,P1,press,1.0,2.0,unreached,,,,,,,,\n");
+        CHECK(lv.level == "My Level" && lv.macro == "a.txt" && lv.items.size() == 1 && lv.items[0].width == 3);
+        CHECK(parseResultsCsv("garbage\n\n,,,\n").items.empty());
     }
 
     SECTION("analyzer: horizon - a late death needs a long enough horizon");
@@ -343,9 +362,9 @@ static void testAnalyzer() {
         MacroFile m2 = parseMacro(macroText({{100, 1, 0}, {400, 0, 0}}));
         FakeLevel lv2;
         lv2.rules[0] = {98, 100, 30};  // pressing early kills 30 ticks later
-        AnalyzerSettings sShort; sShort.horizonMinTicks = 10; sShort.horizonGroups = 0;
+        AnalyzerSettings sShort; sShort.radius = 8; sShort.horizonMinTicks = 10; sShort.horizonGroups = 0;
         Analyzer a1(m2, sShort); drive(&a1, lv2);
-        AnalyzerSettings sLong; sLong.horizonMinTicks = 60; sLong.horizonGroups = 0;
+        AnalyzerSettings sLong; sLong.radius = 8; sLong.horizonMinTicks = 60; sLong.horizonGroups = 0;
         Analyzer a2(m2, sLong); drive(&a2, lv2);
         const GroupReport* s1 = byNumber(a1, 1); const GroupReport* s2 = byNumber(a2, 1);
         CHECK(s1 && s2);
