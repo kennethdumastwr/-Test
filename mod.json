@@ -27,6 +27,18 @@
         "slider": true
       }
     },
+    "max-width": {
+      "name": "Stop at width (10+)",
+      "description": "As soon as a click window is this many ticks wide it is labelled 10+ and the next click is analysed. 0 = measure every window fully.",
+      "type": "int",
+      "default": 10,
+      "min": 0,
+      "max": 40,
+      "control": {
+        "input": true,
+        "slider": true
+      }
+    },
     "thorough-scan": {
       "name": "Thorough scan",
       "description": "Test EVERY offset in the radius instead of stopping at the first fail on each side. Slower, but finds separate passing islands.",
@@ -61,6 +73,12 @@
         "input": true,
         "slider": false
       }
+    },
+    "use-checkpoints": {
+      "name": "Use practice checkpoints",
+      "description": "In practice mode, start every trial from a checkpoint taken at the previous input of the ORIGINAL macro instead of the level start (much faster). Falls back to the level start by itself if the checkpoint run does not reproduce the original timing. NOTE: analysing clears the practice checkpoints you placed yourself.",
+      "type": "bool",
+      "default": true
     },
     "pass-section": {
       "name": "What counts as PASS",

@@ -16,4 +16,7 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
+# Uncomment if the build says createCheckpoint / loadFromCheckpoint do not exist (disables checkpoint fast mode):
+# target_compile_definitions(${PROJECT_NAME} PRIVATE FW_NO_CHECKPOINTS)
+
 setup_geode_mod(${PROJECT_NAME})
