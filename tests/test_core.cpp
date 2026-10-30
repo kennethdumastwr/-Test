@@ -451,7 +451,24 @@ static void testRealMacroSmoke() {
     CHECK(!a.report().refDied);
 }
 
+static void testWrap() {
+    SECTION("report: wrapping keeps one colour tag per line");
+    auto l = wrapLine("aaaa bbbb cccc dddd eeee", 10);
+    CHECK(l.size() >= 3);
+    for (auto& x : l) CHECK(x.size() <= 12);
+    CHECK(wrapLine("short", 10).size() == 1);
+    CHECK(wrapLine("x", 0).size() == 1);
+    std::string out;
+    ReportStyle st; st.tags = true; st.wrap = 12;
+    addLine(out, st, "cr", "one two three four five six");
+    int opens = 0, closes = 0;
+    for (size_t i = 0; (i = out.find("<cr>", i)) != std::string::npos; ++i) ++opens;
+    for (size_t i = 0; (i = out.find("</c>", i)) != std::string::npos; ++i) ++closes;
+    CHECK(opens == closes && opens >= 2);
+}
+
 int main() {
+    testWrap();
     testParser();
     testGroups();
     testCursor();
