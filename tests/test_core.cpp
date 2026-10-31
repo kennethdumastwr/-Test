@@ -484,6 +484,104 @@ static void testRealMacroSmoke() {
     CHECK(!a.report().refDied);
 }
 
+static void testHorizonFreeResume() {
+    SECTION("horizon: default = survive until the next input of the original macro");
+    {
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}}));
+        FakeLevel lv;
+        lv.rules[0] = {98, 100, 40};  // pressing early kills 40 ticks later, i.e. AFTER the release at tick 130
+        AnalyzerSettings d; d.radius = 8; d.maxWidth = 0; d.useCheckpoints = false; d.skipFreeReleases = false;
+        Analyzer a(m, d); drive(&a, lv);
+        const GroupReport* g = byNumber(a, 1);
+        CHECK(g && g->endTick == 130);
+        CHECK(g->w.lo == -8 && g->w.clipLo == Limit::Radius);   // the late death is outside "until the release"
+        AnalyzerSettings far = d; far.horizonMinTicks = 60;
+        Analyzer b(m, far); drive(&b, lv);
+        CHECK(byNumber(b, 1)->w.lo == -2 && byNumber(b, 1)->w.hi == 0);   // asking for a longer horizon sees it
+        // a release must survive until the next click
+        MacroFile m2 = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}, {160, 1, 0}}));
+        FakeLevel lv2; lv2.rules[1] = {129, 131, 0};
+        Analyzer c(m2, d); drive(&c, lv2);
+        CHECK(byNumber(c, 2)->endTick == 160);
+    }
+
+    SECTION("free releases: survive -10 and +10 -> skipped with 2 trials");
+    {
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {200, 0, 0}, {300, 1, 0}, {304, 0, 0}, {400, 1, 0}}));
+        FakeLevel lv;
+        lv.rules[0] = {98, 102, 0};
+        lv.rules[1] = {150, 250, 0};      // very forgiving release
+        lv.rules[2] = {298, 302, 0};
+        lv.rules[3] = {303, 306, 0};      // release 4 ticks after the press: -10 is not reachable, so no probe
+        lv.rules[4] = {399, 401, 0};
+        AnalyzerSettings st; st.radius = 10; st.maxWidth = 0; st.useCheckpoints = false;
+        Analyzer a(m, st); drive(&a, lv);
+        auto rel = byNumber(a, 2);
+        CHECK(rel && rel->state == GroupState::Free && rel->w.trials == 2);
+        auto near = byNumber(a, 4);
+        CHECK(near && near->state == GroupState::Analyzed && near->w.lo == -1 && near->w.hi == 2);
+        CHECK(byNumber(a, 1)->state == GroupState::Analyzed);   // presses are never filtered
+        CHECK(formatCsv(a, 240).find(",free,") != std::string::npos);
+
+        AnalyzerSettings off = st; off.skipFreeReleases = false;
+        Analyzer b(m, off); drive(&b, lv);
+        CHECK(byNumber(b, 2)->state == GroupState::Analyzed && byNumber(b, 2)->w.lo == -10 && byNumber(b, 2)->w.hi == 10);
+
+        FakeLevel lv2 = lv; lv2.rules[1] = {196, 210, 0};       // -10 fails -> not free, real window, probe results reused
+        Analyzer c(m, st); drive(&c, lv2);
+        CHECK(byNumber(c, 2)->state == GroupState::Analyzed && byNumber(c, 2)->w.lo == -4 && byNumber(c, 2)->w.hi == 10);
+    }
+
+    SECTION("resume: interrupted analysis continues, finished inputs are not measured again");
+    {
+        std::vector<std::tuple<int, int, int>> ev;
+        FakeLevel lv;
+        for (int i = 0; i < 12; ++i) { ev.push_back({200 + i * 120, 1, 0}); ev.push_back({240 + i * 120, 0, 0}); }
+        for (int i = 0; i < 12; ++i) { lv.rules[2 * i] = {198 + i * 120, 202 + i * 120, 0}; lv.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0}; }
+        MacroFile m = parseMacro(macroText(ev));
+        AnalyzerSettings st; st.useCheckpoints = false; st.maxWidth = 0; st.skipFreeReleases = false;
+
+        Analyzer full(m, st); drive(&full, lv);
+        CHECK(full.report().complete);
+        CHECK(formatCsv(full, 240).find("# complete 1") != std::string::npos);
+
+        Analyzer part(m, st);
+        for (int i = 0; i < 70; ++i) { auto sp = part.nextTrial(); if (!sp) break; part.submit(runFake(lv, *sp)); }
+        (void)part.nextTrial();
+        part.cancel("paused");
+        std::string csv = formatCsv(part, 240);
+        CHECK(csv.find("# complete 0") != std::string::npos);
+        SavedResults saved = parseResultsCsv(csv);
+        CHECK(!saved.complete && saved.total == 24 && saved.done > 0 && saved.done < 24);
+        std::printf("  interrupted after 70 trials: %d of %d inputs saved\n", saved.done, saved.total);
+
+        Analyzer res(m, st);
+        res.usePrior(saved.rows);
+        drive(&res, lv);
+        CHECK(res.report().complete && res.report().resumed == saved.done);
+        bool same = true;
+        for (size_t i = 0; i < full.report().groups.size(); ++i) {
+            const auto& x = full.report().groups[i]; const auto& y = res.report().groups[i];
+            if (x.state != y.state || x.w.lo != y.w.lo || x.w.hi != y.w.hi || x.w.clipLo != y.w.clipLo || x.w.clipHi != y.w.clipHi) same = false;
+        }
+        CHECK(same);
+        std::printf("  trials: full %d, interrupted %d + resumed %d\n", full.report().totalTrials, part.report().totalTrials, res.report().totalTrials);
+        CHECK(res.report().totalTrials < full.report().totalTrials);
+
+        // a changed macro (other x) must not take over old rows
+        MacroFile other = parseMacro(macroText({{300, 1, 0}, {340, 0, 0}}));
+        Analyzer w(other, st); w.usePrior(saved.rows);
+        FakeLevel lvo; drive(&w, lvo);
+        CHECK(w.report().resumed == 0);
+    }
+
+    SECTION("sound pitch: 5+ normal, -0.1 per frame down to 1");
+    CHECK(pitchForWidth(10) == 1.0f && pitchForWidth(5) == 1.0f);
+    CHECK(std::fabs(pitchForWidth(4) - 0.9f) < 1e-6 && std::fabs(pitchForWidth(3) - 0.8f) < 1e-6);
+    CHECK(std::fabs(pitchForWidth(2) - 0.7f) < 1e-6 && std::fabs(pitchForWidth(1) - 0.6f) < 1e-6);
+    CHECK(std::fabs(pitchForWidth(0) - 0.6f) < 1e-6);
+}
+
 static void testCapAndCheckpoints() {
     SECTION("window: width cap stops early and reports N+");
     {
@@ -596,6 +694,7 @@ static void testWrap() {
 }
 
 int main() {
+    testHorizonFreeResume();
     testCapAndCheckpoints();
     testSeekAndOld();
     testWrap();
