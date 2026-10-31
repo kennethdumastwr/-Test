@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "macro.hpp"
+#include "overlay.hpp"
 #include "window.hpp"
 
 namespace fw {
@@ -32,8 +33,13 @@ struct AnalyzerSettings {
     bool thorough = false;
     int probeBeyond = 0;        // 0 = stop at the first FAIL on each side
     bool verify = false;        // true = run each boundary twice
-    int horizonGroups = 2;      // survive until this many following inputs (same player) fired...
-    int horizonMinTicks = 120;  // ...and at least this many ticks after the tested input
+    // PASS = survive until the next input(s) of the ORIGINAL macro: a click must survive until its release,
+    // a release until the next click. (Defaults: 1 following input, no extra ticks.)
+    int horizonGroups = 1;      // survive until this many following inputs (same player) fired...
+    int horizonMinTicks = 0;    // ...and at least this many ticks after the tested input
+    int horizonMargin = 0;      // extra ticks survived after the following input fired
+    bool skipFreeReleases = true;  // a release that survives -N and +N ticks is "free" and not analysed
+    int freeReleaseTicks = 10;
     bool horizonToEnd = false;  // survive to the end of the reference run
     double epsilon = 0.001;     // x tolerance used by playback
     int onlyAction = 0;         // 1-based action number, 0 = every input
@@ -67,7 +73,7 @@ struct TrialResult {
     std::vector<double> ys;      // only if recordX: ys[t] = y before tick t (used to place the on-screen markers)
 };
 
-enum class GroupState { NotSelected, Analyzed, Redundant, Unreached, Unmappable };
+enum class GroupState { NotSelected, Analyzed, Redundant, Unreached, Unmappable, Free };
 
 struct GroupReport {
     int group = 0;
@@ -97,6 +103,9 @@ struct Report {
     bool refCompleted = false;
     bool refTimedOut = false;
     bool usedCheckpoints = false;
+    bool complete = false;      // every selected input was finished (not cancelled)
+    int resumed = 0;            // inputs taken over from an earlier, interrupted analysis
+    int cpCaptured = 0;
     std::string note;  // top-level problem, empty if none
     int totalTrials = 0;
     bool cancelled = false;
@@ -129,6 +138,9 @@ public:
         refFire_.assign(gs_.groups.size(), -1);
     }
 
+    // Results of an interrupted analysis of the SAME macro: finished inputs are taken over instead of re-measured.
+    void usePrior(const std::vector<PriorRow>& rows) { prior_ = rows; }
+
     const Report& report() const { return report_; }
     const GroupSet& groups() const { return gs_; }
     const MacroFile& macro() const { return macro_; }
@@ -149,7 +161,10 @@ public:
     void cancel(const std::string& why) {
         report_.cancelled = true;
         report_.cancelReason = why;
-        if (cur_) finalizeGroup();
+        if (cur_) {  // an unfinished search is NOT a result: leave that input for a later resume
+            report_.groups[cur_->group].state = GroupState::NotSelected;
+            cur_.reset();
+        }
         stage_ = Stage::Done;
         pendingSpec_.reset();
     }
@@ -177,8 +192,22 @@ public:
 
         while (true) {
             if (!cur_) {
-                if (nextSel_ >= selected_.size()) { stage_ = Stage::Done; return std::nullopt; }
+                if (nextSel_ >= selected_.size()) { report_.complete = !report_.cancelled; stage_ = Stage::Done; return std::nullopt; }
                 beginGroup(selected_[nextSel_++]);
+                continue;
+            }
+            if (cur_->freeIdx < cur_->freeOffsets.size()) {  // release filter probes first
+                pendingOffset_ = cur_->freeOffsets[cur_->freeIdx];
+                pendingSpec_ = buildTrial(pendingOffset_);
+                stage_ = Stage::WaitTrial;
+                return pendingSpec_;
+            }
+            if (cur_->freeAllPass && !cur_->freeOffsets.empty()) {
+                GroupReport& rep = report_.groups[cur_->group];
+                rep.state = GroupState::Free;
+                rep.w = WindowResult{};
+                rep.w.trials = static_cast<int>(cur_->freeOffsets.size());
+                cur_.reset();
                 continue;
             }
             std::optional<int> off = cur_->search.next();
@@ -205,12 +234,21 @@ public:
         if (stage_ == Stage::WaitReference) { processReference(r); return; }
         if (stage_ != Stage::WaitTrial || !cur_) return;
         ++report_.totalTrials;
-        cur_->search.submit(pendingOffset_, classify(r));
+        const Verdict v = classify(r);
+        cur_->search.submit(pendingOffset_, v);  // also seeds the real search with the probe results
+        if (cur_->freeIdx < cur_->freeOffsets.size() && pendingOffset_ == cur_->freeOffsets[cur_->freeIdx]) {
+            ++cur_->freeIdx;
+            if (v != Verdict::Pass) {  // not free: stop probing, run the normal search
+                cur_->freeAllPass = false;
+                cur_->freeIdx = cur_->freeOffsets.size();
+            }
+        }
         pendingSpec_.reset();
         stage_ = Stage::Search;
     }
 
 private:
+    static constexpr int kHorizonTail = 60;  // ticks to survive after the last inputs of the macro
     enum class Stage { NeedReference, WaitReference, Search, WaitTrial, Done };
 
     struct Current {
@@ -221,6 +259,9 @@ private:
         int cpTick = -1;
         bool usingCp = false;
         bool fellBack = false;
+        std::vector<int> freeOffsets;  // release filter: +N then -N
+        size_t freeIdx = 0;
+        bool freeAllPass = true;
         SearchConfig cfg;
         WindowSearch search;
         Current(int g, int t, int e, bool c, int cp, const SearchConfig& config)
@@ -240,6 +281,7 @@ private:
         report_.refTimedOut = r.timedOut;
         cpTicks_.clear();
         for (int t : r.checkpointTicks) cpTicks_.insert(t);
+        report_.cpCaptured = static_cast<int>(cpTicks_.size());
         report_.usedCheckpoints = s_.useCheckpoints && !cpTicks_.empty();
         xs_ = r.xs;
         ys_ = r.ys;
@@ -293,9 +335,52 @@ private:
         return -1;
     }
 
+    // Take over a finished input of an interrupted analysis (same number AND same x).
+    bool takePrior(int gi) {
+        const Group& g = gs_.groups[gi];
+        for (const PriorRow& pr : prior_) {
+            if (pr.number != g.number || std::fabs(pr.x - g.x) > 1e-3) continue;
+            GroupReport& rep = report_.groups[gi];
+            if (pr.state == "free") {
+                rep.state = GroupState::Free;
+            } else if (pr.state == "analyzed" && pr.width > 0 && pr.flags.find("BASE-FAIL") == std::string::npos) {
+                rep.state = GroupState::Analyzed;
+                rep.w.lo = pr.lo;
+                rep.w.hi = pr.hi;
+                auto lim = [](char c) {
+                    switch (c) {
+                        case 'R': return Limit::Radius;
+                        case 'N': return Limit::Neighbor;
+                        case 'P': return Limit::Plateau;
+                        case 'E': return Limit::RefEnd;
+                        case 'S': return Limit::Start;
+                        case 'C': return Limit::Cap;
+                        default: return Limit::None;
+                    }
+                };
+                rep.w.clipLo = lim(pr.clipLo);
+                rep.w.clipHi = lim(pr.clipHi);
+                if (rep.w.clipHi == Limit::Cap) { rep.w.capped = true; rep.w.capWidth = pr.width; }
+                rep.w.unstable = pr.flags.find("UNSTABLE") != std::string::npos;
+                rep.w.drift = pr.flags.find("DRIFT") != std::string::npos;
+                rep.w.island = pr.flags.find("ISLAND") != std::string::npos;
+                rep.cpFallback = pr.flags.find("CP-FALLBACK") != std::string::npos;
+                rep.horizonCapped = pr.flags.find("HORIZON-CAPPED") != std::string::npos;
+            } else {
+                return false;
+            }
+            rep.y = pr.y;
+            rep.refTick = refFire_[gi];
+            ++report_.resumed;
+            return true;
+        }
+        return false;
+    }
+
     void beginGroup(int gi) {
         GroupReport& rep = report_.groups[gi];
         if (isNoOp(gi)) { rep.state = GroupState::Redundant; return; }
+        if (takePrior(gi)) return;
         const int T = refFire_[gi];
         rep.refTick = T;
         if (T < 0 || (refDeath_ >= 0 && T >= refDeath_)) { rep.state = GroupState::Unreached; return; }
@@ -337,13 +422,14 @@ private:
             return;
         }
 
-        // ---- end tick: identical for every offset, so results are comparable
+        // ---- end tick: identical for every offset, so results are comparable.
+        // Default: the next input of the ORIGINAL macro (a click must survive until its release, a release until the next click).
         int end;
         bool capped = false;
         if (s_.horizonToEnd) {
             end = last;
         } else {
-            end = T + std::max(1, s_.horizonMinTicks);
+            end = T + std::max(0, s_.horizonMinTicks);
             const auto& list = gs_.byPlayer[gs_.groups[gi].player];
             int at = -1;
             for (size_t i = 0; i < list.size(); ++i) if (list[i] == gi) at = static_cast<int>(i);
@@ -353,8 +439,9 @@ private:
                 ++seen;
                 int t = refFire_[list[i]];
                 if (t < 0) break;
-                end = std::max(end, t + 6);
+                end = std::max(end, t + std::max(0, s_.horizonMargin));
             }
+            if (seen < s_.horizonGroups) end = std::max(end, T + kHorizonTail);  // fewer inputs left than asked for
         }
         int cap = last;
         if (refDeath_ >= 0) cap = std::min(cap, refDeath_ - 1);
@@ -367,6 +454,10 @@ private:
         rep.horizonCapped = capped;
         const int cpTick = (s_.useCheckpoints && prevT >= 0 && cpTicks_.count(prevT)) ? prevT : -1;
         cur_ = std::make_unique<Current>(gi, T, end, capped, cpTick, cfg);
+        if (s_.skipFreeReleases && gs_.groups[gi].kind == GroupKind::Release) {
+            const int n = std::max(1, s_.freeReleaseTicks);
+            if (cfg.rangeHi >= n && cfg.rangeLo <= -n) cur_->freeOffsets = {n, -n};  // can only conclude if both are reachable
+        }
     }
 
     void finalizeGroup() {
@@ -419,6 +510,7 @@ private:
     GroupSet gs_;
     Report report_;
     Stage stage_ = Stage::NeedReference;
+    std::vector<PriorRow> prior_;
     std::set<int> cpTicks_;
     std::vector<double> xs_, ys_;
     std::vector<int> refFire_;

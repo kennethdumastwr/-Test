@@ -89,6 +89,7 @@ inline std::string formatLine(const GroupSet& gs, const GroupReport& g, const Re
     switch (g.state) {
         case GroupState::NotSelected: return head + "  (not selected)";
         case GroupState::Redundant: return head + "  no state change - skipped";
+        case GroupState::Free: return head + "  free release (survives the +- probe) - not analysed";
         case GroupState::Unreached: tag = "cr"; return head + "  never reached in the reference run";
         case GroupState::Unmappable: tag = "co"; return head + "  x not growing here, cannot place on ticks";
         case GroupState::Analyzed: break;
@@ -109,7 +110,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
     addLine(out, st, nullptr, "macro: " + macroName + (m.levelName.empty() ? "" : "  level: " + m.levelName));
     addLine(out, st, nullptr, "actions: " + std::to_string(m.actions.size()) + "  inputs: " + std::to_string(a.groups().groups.size()) +
                                   "  trials: " + std::to_string(r.totalTrials));
-    if (r.cancelled) addLine(out, st, "cr", "CANCELLED: " + r.cancelReason + " (partial results)");
+    if (r.cancelled) addLine(out, st, "cr", "CANCELLED: " + r.cancelReason + ". Partial results are saved: press Resume in the menu to continue.");
     if (!r.note.empty()) addLine(out, st, "cr", r.note);
     if (r.referenceRan) {
         if (r.refDied) {
@@ -120,11 +121,11 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
         } else if (r.refCompleted) addLine(out, st, nullptr, "reference run: completed the level");
         else if (r.refTimedOut) addLine(out, st, "co", "reference run hit the time limit");
         else addLine(out, st, nullptr, "reference run: survived " + std::to_string(r.refTicks) + " ticks");
-        addLine(out, st, nullptr, std::string("checkpoints: ") + (r.usedCheckpoints ? "used (fast mode)" : "not used (levels restart from the start)"));
+        addLine(out, st, nullptr, std::string("checkpoints: ") + (r.usedCheckpoints ? "used (fast mode), captured " + std::to_string(r.cpCaptured) : "not used (every trial restarts from the level start)"));
     }
     for (const std::string& w : m.warnings) addLine(out, st, "co", "note: " + w);
     {
-        int analyzed = 0, unreached = 0, unmappable = 0, noop = 0, basefail = 0, drift = 0, unstable = 0, clipped = 0;
+        int analyzed = 0, unreached = 0, unmappable = 0, noop = 0, basefail = 0, drift = 0, unstable = 0, clipped = 0, freeRel = 0;
         for (const GroupReport& g : r.groups) {
             switch (g.state) {
                 case GroupState::Analyzed:
@@ -133,6 +134,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
                     clipped += (g.w.clipLo != Limit::None || g.w.clipHi != Limit::None);
                     break;
                 case GroupState::Unreached: ++unreached; break;
+                case GroupState::Free: ++freeRel; break;
                 case GroupState::Unmappable: ++unmappable; break;
                 case GroupState::Redundant: ++noop; break;
                 default: break;
@@ -145,7 +147,9 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
         if (unstable) sum += ", " + std::to_string(unstable) + " unstable";
         if (unmappable) sum += ", " + std::to_string(unmappable) + " unmappable";
         if (clipped) sum += ", " + std::to_string(clipped) + " clipped";
+        if (freeRel) sum += ", " + std::to_string(freeRel) + " free releases";
         if (noop) sum += ", " + std::to_string(noop) + " no-op";
+        if (r.resumed) sum += ", " + std::to_string(r.resumed) + " resumed";
         addLine(out, st, (unreached || basefail || drift || unstable || unmappable) ? "co" : "cg", sum);
     }
     addLine(out, st, nullptr, "Edge letters: R radius, N neighbour input, S start, E end of reference, P x flat. A letter means no FAIL was found before that limit. 10+ = at least that wide, not measured further.");
@@ -164,19 +168,24 @@ inline std::string limitCsv(Limit l) { return l == Limit::None ? std::string() :
 inline std::string formatCsv(const Analyzer& a, double tps) {
     std::string out;
     if (!a.macro().levelName.empty()) out += "# level " + a.macro().levelName + "\n";
+    {
+        int total = 0;
+        for (const Group& g : a.groups().groups) total += g.kind != GroupKind::NoOp;
+        out += std::string("# complete ") + (a.report().complete ? "1" : "0") + "\n# total " + std::to_string(total) + "\n";
+    }
     out += "numbers,player,kind,x,y,state,lo,hi,width_ticks,width_ms,clip_lo,clip_hi,flags,trials\n";
     for (const GroupReport& g : a.report().groups) {
         if (g.state == GroupState::NotSelected) continue;
         const Group& grp = a.groups().groups[g.group];
         const char* st = g.state == GroupState::Analyzed ? "analyzed" : g.state == GroupState::Redundant ? "no-op"
-                         : g.state == GroupState::Unreached ? "unreached" : "unmappable";
+                         : g.state == GroupState::Free ? "free" : g.state == GroupState::Unreached ? "unreached" : "unmappable";
         out += numbersText(grp).substr(1) + "," + (grp.player ? "P2" : "P1") + "," + kindName(g.kind) + "," + fmt("%.6f", g.x) + "," + fmt("%.3f", g.y) + "," + st + ",";
         if (g.state == GroupState::Analyzed && !g.w.baseFailed) {
             out += std::to_string(g.w.lo) + "," + std::to_string(g.w.hi) + "," + std::to_string(g.w.width()) + "," +
                    fmt("%.2f", g.w.width() * 1000.0 / tps) + "," + limitCsv(g.w.clipLo) + "," + limitCsv(g.w.clipHi) + "," +
                    flagsText(g) + "," + std::to_string(g.w.trials);
         } else {
-            out += ",,,,,," + (g.w.baseFailed ? std::string("BASE-FAIL") : std::string()) + ",";
+            out += ",,,,,," + (g.state == GroupState::Free ? std::string("free") : g.w.baseFailed ? std::string("BASE-FAIL") : std::string()) + ",";
         }
         out += "\n";
     }

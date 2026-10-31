@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -64,6 +65,10 @@ namespace {
         double expectedTps = 240.0;
         bool saveReport = true;
         int ignoreEarlyTicks = 0;
+        bool pendingRestart = false;  // after a cancel: restart the level once the player resumes (clears placed checkpoints)
+        int budgetMs = 14;           // 'max CPU' mode: milliseconds of analysis per real frame
+        int cpRestores = 0;          // trials that really started from a checkpoint
+        int cpMissing = 0;           // trials that wanted one but could not load it
         int overlayRevision = 0;     // bumped when new results are saved so the markers reload
         int anticheatHits = 0;       // hits of the game's hidden anti-cheat spike ignored during this analysis
 #ifndef FW_NO_CHECKPOINTS
@@ -141,6 +146,9 @@ namespace {
         s.horizonGroups = static_cast<int>(mod->getSettingValue<int64_t>("horizon-groups"));
         s.horizonMinTicks = static_cast<int>(mod->getSettingValue<int64_t>("horizon-min-ticks"));
         s.horizonToEnd = mod->getSettingValue<bool>("horizon-to-end");
+        s.horizonMargin = static_cast<int>(mod->getSettingValue<int64_t>("horizon-margin"));
+        s.skipFreeReleases = mod->getSettingValue<bool>("skip-free-releases");
+        s.freeReleaseTicks = static_cast<int>(mod->getSettingValue<int64_t>("free-release-ticks"));
         s.epsilon = mod->getSettingValue<double>("x-epsilon");
         s.onlyAction = static_cast<int>(mod->getSettingValue<int64_t>("only-action"));
         s.maxWidth = static_cast<int>(mod->getSettingValue<int64_t>("max-width"));
@@ -174,6 +182,7 @@ namespace {
         Ref<CCNode> hud;                    // 1 / 2 / 3 / 4 / 5+ counter, fixed on screen
         Ref<CCLabelBMFont> hudLabels[5];
         std::vector<fw::OverlayItem> items; // sorted by x
+        std::vector<Ref<CCNode>> nodes;     // ring + number per click, hidden until the player reaches it
         int passed = 0;                     // how many clicks the player already went past
         double lastX = 0.0;
         std::string key;
@@ -186,6 +195,7 @@ namespace {
         ov.hud = nullptr;
         for (auto& l : ov.hudLabels) l = nullptr;
         ov.items.clear();
+        ov.nodes.clear();
         ov.passed = 0;
         ov.key.clear();
     }
@@ -209,19 +219,16 @@ namespace {
             if (ov.hudLabels[i]) ov.hudLabels[i]->setString((std::string(names[i]) + "  " + std::to_string(h[i])).c_str());
     }
 
-    // expanding circle when the player reaches a click
-    void pulse(const fw::OverlayItem& it) {
-        if (!ov.world) return;
-        const fw::Rgb c = fw::widthColor(it.width);
-        auto d = CCDrawNode::create();
-        auto pts = circlePoints(0.f, 0.f, 8.f);
-        const ccColor4F fill = ccc4f(c.r / 255.f, c.g / 255.f, c.b / 255.f, 0.35f);
-        d->drawPolygon(pts.data(), static_cast<unsigned int>(pts.size()), fill, 0.f, fill);
-        d->setPosition(ccp(static_cast<float>(it.x), static_cast<float>(it.y)));
-        ov.world->addChild(d, 5);
-        d->runAction(CCSequence::create(CCScaleTo::create(0.3f, 3.2f), CCRemoveSelf::create(), nullptr));
+    // click sound: normal pitch at 5+, 0.1 lower per frame of window down to 1 (0.6)
+    void playWindowSound(int width) {
+        auto mod = Mod::get();
+        if (!mod->getSettingValue<bool>("overlay-sound")) return;
+        const std::string path = (mod->getResourcesDir() / "window_click.mp3").string();
+        FMODAudioEngine::sharedEngine()->playEffect(path, fw::pitchForWidth(width), 0.f,
+                                                    static_cast<float>(mod->getSettingValue<double>("sound-volume")));
     }
 
+    // a click's ring + window number only appear when the player reaches that click (click 8 is not visible while you are on click 1)
     void updateOverlayProgress(PlayLayer* pl) {
         if (!ov.world || ov.items.empty()) return;
         const double x = playerX(pl->m_player1);
@@ -230,10 +237,14 @@ namespace {
                                                         [](double v, const fw::OverlayItem& it) { return v < it.x; }) - ov.items.begin());
         if (n == ov.passed) { ov.lastX = x; return; }
         const bool forward = n > ov.passed && x >= ov.lastX;
-        if (forward && n - ov.passed <= 3) {
-            for (int k = ov.passed; k < n; ++k) pulse(ov.items[k]);
+        const bool sound = forward && n - ov.passed <= 3;  // a respawn / big jump resyncs silently
+        const int total = static_cast<int>(ov.nodes.size());
+        for (int k = 0; k < total; ++k) {
+            const bool shown = k < n;
+            if (ov.nodes[k]) ov.nodes[k]->setVisible(shown);
+            if (sound && shown && k >= ov.passed) playWindowSound(ov.items[k].width);
         }
-        ov.passed = n;  // a respawn / restart (n went down, or a big jump) just resyncs silently
+        ov.passed = n;
         ov.lastX = x;
         refreshHud();
     }
@@ -276,20 +287,27 @@ namespace {
         ov.lastX = playerX(pl->m_player1);
 
         auto world = CCNode::create();
-        auto rings = CCDrawNode::create();
-        for (const fw::OverlayItem& it : ov.items) {
+        for (size_t k = 0; k < ov.items.size(); ++k) {
+            const fw::OverlayItem& it = ov.items[k];
             const fw::Rgb c = fw::widthColor(it.width);
             const ccColor4F col = ccc4f(c.r / 255.f, c.g / 255.f, c.b / 255.f, 1.f);
+            auto node = CCNode::create();
+
+            auto ring = CCDrawNode::create();
             auto pts = circlePoints(static_cast<float>(it.x), static_cast<float>(it.y), 7.5f);
-            rings->drawPolygon(pts.data(), static_cast<unsigned int>(pts.size()), ccc4f(0.f, 0.f, 0.f, 0.f), 2.4f, col);  // hollow ring
+            ring->drawPolygon(pts.data(), static_cast<unsigned int>(pts.size()), ccc4f(0.f, 0.f, 0.f, 0.f), 2.4f, col);  // hollow ring
+            node->addChild(ring);
 
             auto label = CCLabelBMFont::create(fw::markerText(it).c_str(), "bigFont.fnt");
             label->setColor({c.r, c.g, c.b});
             label->setScale(0.4f);
             label->setPosition({static_cast<float>(it.x), static_cast<float>(it.y) + 19.f});
-            world->addChild(label, 2);
+            node->addChild(label);
+
+            node->setVisible(static_cast<int>(k) < ov.passed);
+            world->addChild(node);
+            ov.nodes.push_back(node);
         }
-        world->addChild(rings, 1);
         pl->m_objectLayer->addChild(world, 1000);
         ov.world = world;
 
@@ -418,6 +436,7 @@ namespace {
                 const double observed = static_cast<double>(g.tickTotal) / (static_cast<double>(g.updateCalls) * kStepDt);
                 warn = "game ran at ~" + fw::fmt("%.0f", observed) + " ticks/s (expected " + fw::fmt("%.0f", g.expectedTps) + ")";
                 if (std::fabs(observed - g.expectedTps) > g.expectedTps * 0.02) warn = "WARNING: " + warn + ". Windows use the measured rate.";
+                warn += "; checkpoint starts " + std::to_string(g.cpRestores) + (g.cpMissing ? ", not loadable " + std::to_string(g.cpMissing) : std::string());
                 tps = observed;
             }
             if (g.anticheatHits > 0) warn += std::string(warn.empty() ? "" : "; ") + "ignored " + std::to_string(g.anticheatHits) + " anti-cheat spike hits";
@@ -457,6 +476,7 @@ namespace {
 
     void cancelSession(PlayLayer* pl, const std::string& why, bool restartLevel) {
         if (g.analyzer) g.analyzer->cancel(why);
+        if (!restartLevel) g.pendingRestart = true;
         endSession(pl, true, restartLevel);
     }
 
@@ -484,6 +504,7 @@ namespace {
             auto it = g.cps.find(g.spec.checkpointTick);
             if (it != g.cps.end() && it->second) {
                 g.resettingByUs = true;
+                ++g.cpRestores;
                 pl->loadFromCheckpoint(it->second);  // state at the end of that tick: ticks stay absolute
                 g.resettingByUs = false;
                 g.tick = g.spec.checkpointTick + 1;
@@ -492,6 +513,9 @@ namespace {
         }
 #endif
         if (!restored) {
+#ifndef FW_NO_CHECKPOINTS
+            if (g.spec.checkpointTick >= 0) ++g.cpMissing;
+#endif
             g.tick = 0;
             g.resettingByUs = true;
             pl->resetLevelFromStart();
@@ -538,6 +562,8 @@ namespace {
         double avg = 0.0;
         bool hasResults = false;  // current-format results with at least one click
         bool oldFormat = false;   // results from an older version (no y column)
+        bool partial = false;     // an interrupted analysis that can be resumed
+        int done = 0, total = 0;
         bool canDelete() const { return hasResults || oldFormat; }
     };
 
@@ -560,6 +586,9 @@ namespace {
                 e.hasResults = !sr.items.empty();
                 e.clicks = static_cast<int>(sr.items.size());
                 e.avg = fw::averageWidth(sr.items);
+                e.done = sr.done;
+                e.total = sr.total;
+                e.partial = !sr.complete && sr.done > 0;
             }
             out.push_back(e);
         }
@@ -584,7 +613,10 @@ namespace {
         }
 
         auto mod = Mod::get();
-        g.speed = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("speed")), 1, 64);
+        g.speed = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("speed")), 0, 500);  // 0 = as fast as the CPU allows
+        g.budgetMs = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("frame-budget-ms")), 4, 40);
+        g.cpRestores = 0;
+        g.cpMissing = 0;
         g.eps = mod->getSettingValue<double>("x-epsilon");
         g.expectedTps = static_cast<double>(mod->getSettingValue<int64_t>("expected-tps"));
         g.saveReport = mod->getSettingValue<bool>("save-report");
@@ -606,6 +638,16 @@ namespace {
         if (settings.useCheckpoints) toast("Practice mode: fast checkpoint analysis (your own checkpoints get cleared)");
         else if (readSettings().useCheckpoints) toast("Not in practice mode: analysing from the level start (slower)", NotificationIcon::Warning);
         g.analyzer = std::make_unique<fw::Analyzer>(std::move(mf), settings);
+        {
+            std::string prevCsv;
+            if (readFile(resultsCsv(fileName), prevCsv)) {
+                fw::SavedResults prev = fw::parseResultsCsv(prevCsv);
+                if (!prev.complete && prev.done > 0) {  // interrupted earlier: continue instead of starting over
+                    g.analyzer->usePrior(prev.rows);
+                    toast("Resuming: " + std::to_string(prev.done) + " of " + std::to_string(prev.total) + " inputs are already done");
+                }
+            }
+        }
         g.phase = Phase::Running;  // the next update() starts the reference run
         pause->onResume(nullptr);
     }
@@ -656,7 +698,13 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         // reference run: a checkpoint at the END of every tick in which inputs fired = "right after the release of click N"
         if (g.spec.captureCheckpoints && !fires.empty()) {
             if (PlayLayer* pl = PlayLayer::get()) {
-                if (CheckpointObject* cp = pl->createCheckpoint()) {
+                CCArray* arr = pl->m_checkpointArray;
+                const unsigned int before = arr ? arr->count() : 0;
+                pl->markCheckpoint();  // the game's own "place checkpoint": it really appears in the level
+                CheckpointObject* cp = nullptr;
+                if (arr && arr->count() > before) cp = static_cast<CheckpointObject*>(arr->lastObject());
+                if (!cp) cp = pl->createCheckpoint();  // fallback: invisible snapshot
+                if (cp) {
                     g.cps[g.tick] = cp;
                     g.res.checkpointTicks.push_back(g.tick);
                 }
@@ -687,6 +735,12 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             g.pendingText.clear();
             FLAlertLayer::create(nullptr, title.c_str(), text, "Close", nullptr, 420.f, true, 250.f, 0.65f)->show();
         }
+        if (g.pendingRestart && g.phase == Phase::Idle) {  // analysis was cancelled: clean the level (also removes our checkpoints)
+            g.pendingRestart = false;
+            g.resettingByUs = true;
+            pl->resetLevelFromStart();
+            g.resettingByUs = false;
+        }
         refreshOverlay(pl);
         updateOverlayProgress(pl);
         refreshPlayback(pl);
@@ -696,8 +750,13 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         }
 
         ensureLabel();
-        int budget = g.speed;
-        while (budget-- > 0 && g.phase == Phase::Running) {
+        // g.speed > 0: that many 1/60s updates per frame (30 = 30x real time); 0 = as many as fit in the frame budget (max CPU)
+        const auto frameStart = std::chrono::steady_clock::now();
+        const double limitMs = g.speed > 0 ? 45.0 : static_cast<double>(g.budgetMs);
+        const int maxCalls = g.speed > 0 ? g.speed : 100000;
+        int calls = 0;
+        while (calls < maxCalls && g.phase == Phase::Running) {
+            ++calls;
             if (!g.trialActive && !startNextTrial(pl)) break;
             const int before = g.tick;
             g.inFrame = true;
@@ -714,6 +773,8 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
                 g.idleCalls = 0;
             }
             if (trialEnded()) finishTrial();  // the next iteration asks the analyzer for more, or ends the session
+            const double usedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count();
+            if (usedMs >= limitMs) break;     // keep the game responsive
         }
         updateLabel();
     }
@@ -866,11 +927,12 @@ class $modify(FWPause, PauseLayer) {
             std::string shown = e.name.size() > 18 ? e.name.substr(0, 16) + ".." : e.name;
             const bool isSel = e.name == selected && mode > 0;
             label(shown, "bigFont.fnt", 0.4f, -208.f, dy + 7.f, isSel ? ccc3(110, 255, 110) : ccc3(255, 255, 255), true);
-            std::string st = e.hasResults ? std::to_string(e.clicks) + " clicks, avg " + fw::fmt("%.1f", e.avg) + "F"
+            std::string st = e.partial ? "partial " + std::to_string(e.done) + "/" + std::to_string(e.total) + " done - press Resume"
+                             : e.hasResults ? std::to_string(e.clicks) + " clicks, avg " + fw::fmt("%.1f", e.avg) + "F"
                              : e.oldFormat ? std::string("old results - Analyze again")
                                            : std::string("not analysed yet");
             label(st, "chatFont.fnt", 0.5f, -208.f, dy - 8.f, ccc3(170, 200, 255), true);
-            button("Analyze", 0.4f, 8.f, dy, i, menu_selector(FWPause::onMenuAnalyze));
+            button(e.partial ? "Resume" : "Analyze", 0.4f, 8.f, dy, i, menu_selector(FWPause::onMenuAnalyze));
             button("Show", 0.4f, 70.f, dy, i, menu_selector(FWPause::onMenuShow));
             button("Play", 0.4f, 116.f, dy, i, menu_selector(FWPause::onMenuPlay));
             if (e.canDelete()) button("Del", 0.4f, 160.f, dy, i, menu_selector(FWPause::onMenuDelete));
