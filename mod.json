@@ -74,6 +74,24 @@
         "slider": false
       }
     },
+    "skip-free-releases": {
+      "name": "Skip free releases",
+      "description": "A release that survives -N and +N ticks (N below) is not analysed: it has no real window (for example a release after a jump over spikes). Only a test at exactly -N and +N, so a release that fails somewhere in between could be missed.",
+      "type": "bool",
+      "default": true
+    },
+    "free-release-ticks": {
+      "name": "Free release distance (ticks)",
+      "description": "N for the filter above.",
+      "type": "int",
+      "default": 10,
+      "min": 2,
+      "max": 40,
+      "control": {
+        "input": true,
+        "slider": true
+      }
+    },
     "use-checkpoints": {
       "name": "Use practice checkpoints",
       "description": "In practice mode, start every trial from a checkpoint taken at the previous input of the ORIGINAL macro instead of the level start (much faster). Falls back to the level start by itself if the checkpoint run does not reproduce the original timing. NOTE: analysing clears the practice checkpoints you placed yourself.",
@@ -85,10 +103,10 @@
       "type": "title"
     },
     "horizon-groups": {
-      "name": "Survive N following inputs",
-      "description": "A trial passes if the player survives until this many later inputs (same player) fired.",
+      "name": "Survive until N following inputs",
+      "description": "PASS = survive until this many following inputs of the ORIGINAL macro fired. 1 = a click must survive until its release, a release until the next click.",
       "type": "int",
-      "default": 2,
+      "default": 1,
       "min": 0,
       "max": 20,
       "control": {
@@ -97,14 +115,26 @@
     },
     "horizon-min-ticks": {
       "name": "Survive at least (ticks)",
-      "description": "...and at least this many ticks after the tested input.",
+      "description": "...and at least this many ticks after the tested input (0 = off).",
       "type": "int",
-      "default": 120,
-      "min": 10,
+      "default": 0,
+      "min": 0,
       "max": 2400,
       "control": {
         "input": true,
         "slider": false
+      }
+    },
+    "horizon-margin": {
+      "name": "Extra ticks after that input",
+      "description": "Also survive this many ticks after the following input fired.",
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 120,
+      "control": {
+        "input": true,
+        "slider": true
       }
     },
     "horizon-to-end": {
@@ -119,12 +149,25 @@
     },
     "speed": {
       "name": "Speed (updates per frame)",
-      "description": "How many 1/60s game updates run per real frame while analysing. Lower it if the game stutters.",
+      "description": "1/60s game updates run per real frame while analysing. 30 = 30x real time. 0 = MAX: as many as the CPU can do in the frame budget below.",
       "type": "int",
-      "default": 8,
-      "min": 1,
-      "max": 64,
+      "default": 0,
+      "min": 0,
+      "max": 500,
       "control": {
+        "input": true,
+        "slider": true
+      }
+    },
+    "frame-budget-ms": {
+      "name": "Max-speed frame budget (ms)",
+      "description": "Used when Speed is 0: milliseconds of analysis per real frame. Higher = faster analysis but a choppier screen.",
+      "type": "int",
+      "default": 14,
+      "min": 4,
+      "max": 40,
+      "control": {
+        "input": true,
         "slider": true
       }
     },
@@ -195,6 +238,24 @@
       "description": "Show the 1 / 2 / 3 / 4 / 5+ counter in the top-left corner while windows are shown.",
       "type": "bool",
       "default": true
+    },
+    "overlay-sound": {
+      "name": "Click sound",
+      "description": "Play a sound when the player reaches a click: normal pitch for windows of 5+, 0.1 lower per frame down to 1.",
+      "type": "bool",
+      "default": true
+    },
+    "sound-volume": {
+      "name": "Sound volume",
+      "description": "Volume of the click sound.",
+      "type": "float",
+      "default": 0.8,
+      "min": 0.0,
+      "max": 1.0,
+      "control": {
+        "slider": true,
+        "input": true
+      }
     }
   }
 }
