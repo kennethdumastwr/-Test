@@ -148,12 +148,12 @@
       "type": "title"
     },
     "speed": {
-      "name": "Speed (updates per frame)",
-      "description": "1/60s game updates run per real frame while analysing. 30 = 30x real time. 0 = MAX: as many as the CPU can do in the frame budget below.",
+      "name": "Speed (x real time)",
+      "description": "How many times faster than real time the analysis runs, independent of the frame rate (30 = 30x). 0 = MAX: as many ticks as fit in the frame budget below.",
       "type": "int",
-      "default": 0,
+      "default": 30,
       "min": 0,
-      "max": 500,
+      "max": 200,
       "control": {
         "input": true,
         "slider": true
@@ -170,6 +170,12 @@
         "input": true,
         "slider": true
       }
+    },
+    "fast-mode": {
+      "name": "Fast mode (beta)",
+      "description": "Hides the level while analysing, runs the physics in big chunks and decides forgiving clicks (10+) with two trials. Experimental: if results look wrong, turn it off.",
+      "type": "bool",
+      "default": false
     },
     "expected-tps": {
       "name": "Expected TPS",
