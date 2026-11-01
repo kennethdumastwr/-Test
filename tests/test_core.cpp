@@ -217,6 +217,7 @@ struct FakeLevel {
     mutable int flakeBudget = 1;
     int killAtTick = -1;            // reference dies here regardless
     int trials = 0;
+    int captureStride = 1;          // only ticks divisible by this get a checkpoint (simulates frames that end mid-input)
     bool cpArtifact = false;        // simulate a checkpoint restore that does NOT reproduce the original timing
     mutable long long ticksSimulated = 0;
 };
@@ -270,7 +271,7 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
             break;
         }
         r.ticksRun = t + 1;
-        if (spec.captureCheckpoints && !fires.empty()) r.checkpointTicks.push_back(t);
+        if (spec.captureCheckpoints && !fires.empty() && t % lv.captureStride == 0) r.checkpointTicks.push_back(t);
         if (spec.endTick >= 0 && t >= spec.endTick) break;
         if (spec.stopAfterLastFire >= 0 && cur.done() && t >= lastFire + spec.stopAfterLastFire) break;
     }
@@ -635,6 +636,19 @@ static void testCapAndCheckpoints() {
         CHECK(same);
         CHECK(!a1.report().groups[0].usedCheckpoint && a1.report().groups[5].usedCheckpoint);   // first input has nothing before it
 
+        SECTION("checkpoints: frames that end mid-input -> the closest earlier checkpoint is used, same windows");
+        FakeLevel sparse = lv; sparse.captureStride = 7;
+        Analyzer a3(m, on); sparse.ticksSimulated = 0; drive(&a3, sparse);
+        bool sameSparse = true; int usedCp = 0;
+        for (size_t i = 0; i < a0.report().groups.size(); ++i) {
+            const auto& x = a0.report().groups[i]; const auto& y = a3.report().groups[i];
+            if (x.state != y.state || x.w.lo != y.w.lo || x.w.hi != y.w.hi) sameSparse = false;
+            usedCp += y.usedCheckpoint;
+        }
+        CHECK(sameSparse);
+        CHECK(usedCp > 0 && sparse.ticksSimulated < ticksOff);
+        std::printf("  sparse checkpoints: %d inputs started from one, %lld ticks (from start: %lld)\n", usedCp, sparse.ticksSimulated, ticksOff);
+
         SECTION("checkpoints: a restore that does not reproduce the original timing falls back to the level start");
         FakeLevel bad = lv; bad.cpArtifact = true;
         Analyzer a2(m, on); drive(&a2, bad);
@@ -645,8 +659,48 @@ static void testCapAndCheckpoints() {
             fallbacks += y.cpFallback;
         }
         CHECK(allOk);
-        CHECK(fallbacks == 23);   // every input except the first one tried the checkpoint, failed the base run, and was re-measured
-        CHECK(flagsText(a2.report().groups[5]).find("CP-FALLBACK") != std::string::npos);
+        CHECK(fallbacks == 2);   // two failed checkpoint starts are enough: after that the run stops trying checkpoints
+        CHECK(a2.report().cpDisabled && a2.report().cpFallbacks == 2);
+        CHECK(flagsText(a2.report().groups[1]).find("CP-FALLBACK") != std::string::npos);
+        std::printf("  trials with a broken restore: %d (every input retrying would be ~%d)\n", a2.report().totalTrials, a0.report().totalTrials + 2 * 23);
+    }
+}
+
+static void testFastMode() {
+    SECTION("fast mode (beta): extremes decide 10+, calibrated checkpoints skip the base test");
+    std::vector<std::tuple<int, int, int>> ev;
+    FakeLevel lv;
+    for (int i = 0; i < 12; ++i) { ev.push_back({200 + i * 120, 1, 0}); ev.push_back({240 + i * 120, 0, 0}); }
+    for (int i = 0; i < 12; ++i) {
+        const bool wide = (i % 2 == 0);                       // every other click is forgiving (>= 10 wide)
+        lv.rules[2 * i] = wide ? Rule{190 + i * 120, 215 + i * 120, 0} : Rule{198 + i * 120, 202 + i * 120, 0};
+        lv.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0};
+    }
+    MacroFile m = parseMacro(macroText(ev));
+    AnalyzerSettings normal; normal.skipFreeReleases = false;          // checkpoints + maxWidth 10 are the defaults
+    AnalyzerSettings fast = normal; fast.fastMode = true;
+    Analyzer a0(m, normal); drive(&a0, lv);
+    Analyzer a1(m, fast);   drive(&a1, lv);
+    std::printf("  trials: normal %d, fast mode %d\n", a0.report().totalTrials, a1.report().totalTrials);
+    CHECK(a1.report().totalTrials < a0.report().totalTrials);
+    bool same = true; int assumed = 0;
+    for (size_t i = 0; i < a0.report().groups.size(); ++i) {
+        const auto& x = a0.report().groups[i]; const auto& y = a1.report().groups[i];
+        if (x.state != y.state || x.w.width() != y.w.width() || x.w.capped != y.w.capped) same = false;
+        assumed += y.fastAssumed;
+    }
+    CHECK(same);                 // same widths / 10+ labels as the full search on this level
+    CHECK(assumed == 6);         // the six forgiving clicks were decided by two trials each
+    CHECK(flagsText(a1.report().groups[4]).find("FAST-ASSUMED") != std::string::npos);
+    CHECK(a1.report().cpOk >= 3);
+
+    SECTION("fast mode: extreme probe that fails falls back to the normal search");
+    {
+        FakeLevel narrow = lv;
+        narrow.rules[4] = {438, 441, 0};                   // click at tick 440, was forgiving: now [-2,+1]; +5 fails, so no assumption
+        Analyzer a(m, fast); drive(&a, narrow);
+        const GroupReport* g = byNumber(a, 5);
+        CHECK(g && !g->fastAssumed && g->w.lo == -2 && g->w.hi == 1);
     }
 }
 
@@ -694,6 +748,7 @@ static void testWrap() {
 }
 
 int main() {
+    testFastMode();
     testHorizonFreeResume();
     testCapAndCheckpoints();
     testSeekAndOld();
