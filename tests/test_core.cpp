@@ -232,7 +232,7 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
     for (auto& a : spec.actions) maxId = std::max(maxId, a.id);
     std::vector<int> posOfId(maxId + 1, -1);
     for (size_t i = 0; i < spec.actions.size(); ++i) posOfId[spec.actions[i].id] = static_cast<int>(i);
-    const int t0 = spec.checkpointTick >= 0 ? spec.checkpointTick + 1 : 0;   // state restored at the end of that tick
+    const int t0 = spec.startAt >= 0 ? spec.startAt : 0;   // ticks already run in the restored state
     std::multimap<int, int> lateCheck;  // tick -> rule id that must have fired by then
     for (auto& kv : lv.rules) {
         const int pos = kv.first <= maxId ? posOfId[kv.first] : -1;
@@ -241,7 +241,8 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
         if (!before && kv.second.B + 1 > t0) lateCheck.insert({kv.second.B + 1, kv.first});
     }
 
-    int deathAt = lv.cpArtifact && spec.checkpointTick >= 0 ? t0 : INT_MAX;
+    int deathAt = lv.cpArtifact && spec.startAt >= 0 ? t0 : INT_MAX;
+    if (spec.captureCheckpoints) r.checkpointAt.push_back(0);   // the level start
     std::vector<Fire> fires;
     int lastFire = 0;
     if (t0 > 0) cur.seekTo(t0 * lv.speed, fires);
@@ -271,7 +272,7 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
             break;
         }
         r.ticksRun = t + 1;
-        if (spec.captureCheckpoints && !fires.empty() && t % lv.captureStride == 0) r.checkpointTicks.push_back(t);
+        if (spec.captureCheckpoints && !fires.empty() && (t + 1) % lv.captureStride == 0) r.checkpointAt.push_back(t + 1);
         if (spec.endTick >= 0 && t >= spec.endTick) break;
         if (spec.stopAfterLastFire >= 0 && cur.done() && t >= lastFire + spec.stopAfterLastFire) break;
     }
@@ -634,7 +635,7 @@ static void testCapAndCheckpoints() {
             if (x.state != y.state || x.w.lo != y.w.lo || x.w.hi != y.w.hi || y.cpFallback) same = false;
         }
         CHECK(same);
-        CHECK(!a1.report().groups[0].usedCheckpoint && a1.report().groups[5].usedCheckpoint);   // first input has nothing before it
+        CHECK(a1.report().groups[0].usedCheckpoint && a1.report().groups[5].usedCheckpoint);   // even the first input starts from the level-start checkpoint
 
         SECTION("checkpoints: frames that end mid-input -> the closest earlier checkpoint is used, same windows");
         FakeLevel sparse = lv; sparse.captureStride = 7;
@@ -659,9 +660,9 @@ static void testCapAndCheckpoints() {
             fallbacks += y.cpFallback;
         }
         CHECK(allOk);
-        CHECK(fallbacks == 2);   // two failed checkpoint starts are enough: after that the run stops trying checkpoints
-        CHECK(a2.report().cpDisabled && a2.report().cpFallbacks == 2);
-        CHECK(flagsText(a2.report().groups[1]).find("CP-FALLBACK") != std::string::npos);
+        CHECK(fallbacks == 1);   // one failed checkpoint start ends checkpoint use (a from-start run wipes the practice checkpoints)
+        CHECK(a2.report().cpDisabled && a2.report().cpFallbacks == 1);
+        CHECK(flagsText(a2.report().groups[0]).find("CP-FALLBACK") != std::string::npos);
         std::printf("  trials with a broken restore: %d (every input retrying would be ~%d)\n", a2.report().totalTrials, a0.report().totalTrials + 2 * 23);
     }
 }
