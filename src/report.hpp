@@ -70,6 +70,7 @@ inline std::string flagsText(const GroupReport& g) {
     if (g.w.island) f.push_back("ISLAND");
     if (g.horizonCapped) f.push_back("HORIZON-CAPPED");
     if (g.cpFallback) f.push_back("CP-FALLBACK");
+    if (g.fastAssumed) f.push_back("FAST-ASSUMED");
     if (f.empty()) return "stable";
     std::string s;
     for (size_t i = 0; i < f.size(); ++i) s += (i ? " " : "") + f[i];
@@ -121,7 +122,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
         } else if (r.refCompleted) addLine(out, st, nullptr, "reference run: completed the level");
         else if (r.refTimedOut) addLine(out, st, "co", "reference run hit the time limit");
         else addLine(out, st, nullptr, "reference run: survived " + std::to_string(r.refTicks) + " ticks");
-        addLine(out, st, nullptr, std::string("checkpoints: ") + (r.usedCheckpoints ? "used (fast mode), captured " + std::to_string(r.cpCaptured) : "not used (every trial restarts from the level start)"));
+        addLine(out, st, nullptr, std::string("checkpoints: ") + (r.usedCheckpoints ? "captured " + std::to_string(r.cpCaptured) + ", ok on " + std::to_string(r.cpOk) + " inputs, fell back on " + std::to_string(r.cpFallbacks) + (r.cpDisabled ? " (given up: the restore does not reproduce the original timing)" : "") : "not used (every trial restarts from the level start)"));
     }
     for (const std::string& w : m.warnings) addLine(out, st, "co", "note: " + w);
     {

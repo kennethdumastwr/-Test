@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -37,7 +38,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-    constexpr float kStepDt = 1.f / 60.f;  // fixed dt for every analysis frame => identical batching in every trial
 
     enum class Phase { Idle, Running };
 
@@ -67,6 +67,15 @@ namespace {
         int ignoreEarlyTicks = 0;
         bool pendingRestart = false;  // after a cancel: restart the level once the player resumes (clears placed checkpoints)
         int budgetMs = 14;           // 'max CPU' mode: milliseconds of analysis per real frame
+        bool fast = false;           // fast mode (beta)
+        bool hidden = false;         // level hidden while analysing (fast mode)
+        int fireSeenTick = -1;       // last tick index in which inputs fired
+        double simSeconds = 0.0;     // game seconds simulated (for the measured TPS)
+        int cpRestoreFails = 0;      // consecutive failed checkpoint restores
+        bool cpGiveUp = false;
+#ifndef FW_NO_CHECKPOINTS
+        std::map<int, double> cpX;   // player x when each checkpoint was taken (verifies a restore really landed there)
+#endif
         int cpRestores = 0;          // trials that really started from a checkpoint
         int cpMissing = 0;           // trials that wanted one but could not load it
         int overlayRevision = 0;     // bumped when new results are saved so the markers reload
@@ -423,8 +432,13 @@ namespace {
 
     void endSession(PlayLayer* pl, bool showReport, bool restartLevel) {
         g.phase = Phase::Idle;
+        if (g.hidden) {
+            if (PlayLayer* cur = PlayLayer::get()) cur->setVisible(true);
+            g.hidden = false;
+        }
 #ifndef FW_NO_CHECKPOINTS
         g.cps.clear();
+        g.cpX.clear();
 #endif
         g.trialActive = false;
         removeLabel();
@@ -432,8 +446,8 @@ namespace {
         if (showReport && g.analyzer) {
             double tps = g.expectedTps;
             std::string warn;
-            if (g.updateCalls > 0 && g.tickTotal > 0) {
-                const double observed = static_cast<double>(g.tickTotal) / (static_cast<double>(g.updateCalls) * kStepDt);
+            if (g.updateCalls > 0 && g.tickTotal > 0 && g.simSeconds > 0.0) {
+                const double observed = static_cast<double>(g.tickTotal) / g.simSeconds;
                 warn = "game ran at ~" + fw::fmt("%.0f", observed) + " ticks/s (expected " + fw::fmt("%.0f", g.expectedTps) + ")";
                 if (std::fabs(observed - g.expectedTps) > g.expectedTps * 0.02) warn = "WARNING: " + warn + ". Windows use the measured rate.";
                 warn += "; checkpoint starts " + std::to_string(g.cpRestores) + (g.cpMissing ? ", not loadable " + std::to_string(g.cpMissing) : std::string());
@@ -482,6 +496,40 @@ namespace {
 
     void injectFires(GJBaseGameLayer* layer, const std::vector<fw::Fire>& fires);
 
+#ifndef FW_NO_CHECKPOINTS
+    // Start a trial from a checkpoint the way the game itself does it in practice mode: make it the last checkpoint and respawn.
+    // The player must really land at the x it had when the checkpoint was taken, otherwise the restore does not count.
+    bool restoreCheckpoint(PlayLayer* pl, int tick) {
+        if (g.cpGiveUp) return false;
+        auto it = g.cps.find(tick);
+        if (it == g.cps.end() || !it->second) return false;
+        const double want = g.cpX.count(tick) ? g.cpX[tick] : -1.0;
+        auto landed = [&] { return want < 0.0 || std::fabs(playerX(pl->m_player1) - want) < 0.05; };
+
+        bool ok = false;
+        g.resettingByUs = true;
+        if (CCArray* arr = pl->m_checkpointArray) {
+            arr->removeAllObjects();
+            arr->addObject(it->second);
+            pl->resetLevel();  // practice-mode respawn = load the last checkpoint + all the resets the game does around it
+            ok = landed();
+        }
+        if (!ok) {
+            pl->loadFromCheckpoint(it->second);  // second way: the raw load
+            ok = landed();
+        }
+        g.resettingByUs = false;
+
+        if (ok) {
+            g.cpRestoreFails = 0;
+            ++g.cpRestores;
+        } else if (++g.cpRestoreFails >= 3) {
+            g.cpGiveUp = true;  // stop paying for restores that do not land
+        }
+        return ok;
+    }
+#endif
+
     bool startNextTrial(PlayLayer* pl) {
         auto spec = g.analyzer->nextTrial();
         if (!spec) {
@@ -494,6 +542,7 @@ namespace {
         g.res.firedTick.assign(g.spec.actions.size(), -1);
         if (g.spec.recordX) g.res.xs.reserve(4096);
         g.lastFire = -1;
+        g.fireSeenTick = -1;
         g.idleCalls = 0;
         g.probe.clear();
         g.trialActive = true;
@@ -501,15 +550,8 @@ namespace {
         bool restored = false;
 #ifndef FW_NO_CHECKPOINTS
         if (g.spec.checkpointTick >= 0) {
-            auto it = g.cps.find(g.spec.checkpointTick);
-            if (it != g.cps.end() && it->second) {
-                g.resettingByUs = true;
-                ++g.cpRestores;
-                pl->loadFromCheckpoint(it->second);  // state at the end of that tick: ticks stay absolute
-                g.resettingByUs = false;
-                g.tick = g.spec.checkpointTick + 1;
-                restored = true;
-            }
+            restored = restoreCheckpoint(pl, g.spec.checkpointTick);
+            if (restored) g.tick = g.spec.checkpointTick + 1;  // state at the end of that tick: ticks stay absolute
         }
 #endif
         if (!restored) {
@@ -533,6 +575,35 @@ namespace {
             injectFires(pl, fires);
         }
         return true;
+    }
+
+    // How many physics ticks the next update() call should run.
+    int chunkTicks() {
+        if (g.spec.captureCheckpoints) return 1;  // reference run: stop at every tick so checkpoints sit exactly on a tick boundary
+        if (!g.fast) return 4;                    // classic safe step: one 1/60s update
+        int remaining = (g.spec.endTick >= 0) ? g.spec.endTick + 1 - g.tick : 60;  // no overshoot past the end of the trial
+        return std::clamp(remaining, 1, 120);
+    }
+
+    // Place a real practice checkpoint BETWEEN updates (like pressing the practice button), never in the middle of a physics step.
+    void captureCheckpointAfterUpdate(PlayLayer* pl) {
+#ifndef FW_NO_CHECKPOINTS
+        if (!g.spec.captureCheckpoints || g.tick <= 0) return;
+        if (g.fireSeenTick != g.tick - 1) return;  // inputs fired earlier in a multi-tick update: that exact state is gone
+        CCArray* arr = pl->m_checkpointArray;
+        const unsigned int before = arr ? arr->count() : 0;
+        pl->markCheckpoint();
+        CheckpointObject* cp = nullptr;
+        if (arr && arr->count() > before) cp = static_cast<CheckpointObject*>(arr->lastObject());
+        if (!cp) cp = pl->createCheckpoint();  // invisible snapshot as a last resort
+        if (cp) {
+            g.cps[g.tick - 1] = cp;
+            g.cpX[g.tick - 1] = playerX(pl->m_player1);
+            g.res.checkpointTicks.push_back(g.tick - 1);
+        }
+#else
+        (void)pl;
+#endif
     }
 
     bool trialEnded() {
@@ -617,6 +688,10 @@ namespace {
         g.budgetMs = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("frame-budget-ms")), 4, 40);
         g.cpRestores = 0;
         g.cpMissing = 0;
+        g.cpRestoreFails = 0;
+        g.cpGiveUp = false;
+        g.simSeconds = 0.0;
+        g.fast = mod->getSettingValue<bool>("fast-mode");
         g.eps = mod->getSettingValue<double>("x-epsilon");
         g.expectedTps = static_cast<double>(mod->getSettingValue<int64_t>("expected-tps"));
         g.saveReport = mod->getSettingValue<bool>("save-report");
@@ -627,6 +702,7 @@ namespace {
         g.anticheatHits = 0;
         g.trialActive = false;
         fw::AnalyzerSettings settings = readSettings();
+        settings.fastMode = g.fast;
 #ifdef FW_NO_CHECKPOINTS
         settings.useCheckpoints = false;
 #else
@@ -635,7 +711,8 @@ namespace {
 #ifndef FW_NO_CHECKPOINTS
         g.cps.clear();
 #endif
-        if (settings.useCheckpoints) toast("Practice mode: fast checkpoint analysis (your own checkpoints get cleared)");
+        if (g.fast) toast("Fast mode (beta): level hidden while analysing");
+        if (settings.useCheckpoints) toast("Practice mode: checkpoint analysis (your own checkpoints get cleared)");
         else if (readSettings().useCheckpoints) toast("Not in practice mode: analysing from the level start (slower)", NotificationIcon::Warning);
         g.analyzer = std::make_unique<fw::Analyzer>(std::move(mf), settings);
         {
@@ -647,6 +724,10 @@ namespace {
                     toast("Resuming: " + std::to_string(prev.done) + " of " + std::to_string(prev.total) + " inputs are already done");
                 }
             }
+        }
+        if (g.fast) {
+            pl->setVisible(false);  // nothing to draw while analysing: more time for physics
+            g.hidden = true;
         }
         g.phase = Phase::Running;  // the next update() starts the reference run
         pause->onResume(nullptr);
@@ -694,23 +775,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-#ifndef FW_NO_CHECKPOINTS
-        // reference run: a checkpoint at the END of every tick in which inputs fired = "right after the release of click N"
-        if (g.spec.captureCheckpoints && !fires.empty()) {
-            if (PlayLayer* pl = PlayLayer::get()) {
-                CCArray* arr = pl->m_checkpointArray;
-                const unsigned int before = arr ? arr->count() : 0;
-                pl->markCheckpoint();  // the game's own "place checkpoint": it really appears in the level
-                CheckpointObject* cp = nullptr;
-                if (arr && arr->count() > before) cp = static_cast<CheckpointObject*>(arr->lastObject());
-                if (!cp) cp = pl->createCheckpoint();  // fallback: invisible snapshot
-                if (cp) {
-                    g.cps[g.tick] = cp;
-                    g.res.checkpointTicks.push_back(g.tick);
-                }
-            }
-        }
-#endif
+        if (!fires.empty()) g.fireSeenTick = g.tick;
         ++g.tick;
     }
 
@@ -750,21 +815,26 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         }
 
         ensureLabel();
-        // g.speed > 0: that many 1/60s updates per frame (30 = 30x real time); 0 = as many as fit in the frame budget (max CPU)
+        // Speed is "times real time", independent of the frame rate: tick budget per frame = speed * TPS * real frame time.
+        // 0 = max: as many ticks as fit in the frame budget. Each update() call runs a chunk of ticks (see chunkTicks()).
+        const double realDt = std::clamp<double>(dt, 0.001, 0.1);
+        long long tickBudget = g.speed > 0 ? std::max<long long>(1, std::llround(g.speed * g.expectedTps * realDt)) : LLONG_MAX;
         const auto frameStart = std::chrono::steady_clock::now();
         const double limitMs = g.speed > 0 ? 45.0 : static_cast<double>(g.budgetMs);
-        const int maxCalls = g.speed > 0 ? g.speed : 100000;
-        int calls = 0;
-        while (calls < maxCalls && g.phase == Phase::Running) {
-            ++calls;
+        while (g.phase == Phase::Running && tickBudget > 0) {
             if (!g.trialActive && !startNextTrial(pl)) break;
+            const int chunk = static_cast<int>(std::min<long long>(chunkTicks(), tickBudget));
+            const float stepDt = static_cast<float>(chunk / g.expectedTps * 1.0005);  // 0.05% extra so a chunk never rounds down to chunk-1
             const int before = g.tick;
             g.inFrame = true;
-            pl->update(kStepDt);  // whole PlayLayer frame, not just the base-layer part
+            pl->update(stepDt);  // whole PlayLayer update
             g.inFrame = false;
+            const int ran = g.tick - before;
             ++g.updateCalls;
-            g.tickTotal += g.tick - before;
-            if (g.tick == before) {
+            g.tickTotal += ran;
+            g.simSeconds += stepDt;
+            tickBudget -= std::max(1, ran);
+            if (ran == 0) {
                 if (++g.idleCalls > 600) {
                     cancelSession(pl, "no physics ticks observed - the tick hook is not firing on this game version", false);
                     break;
@@ -772,6 +842,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             } else {
                 g.idleCalls = 0;
             }
+            captureCheckpointAfterUpdate(pl);
             if (trialEnded()) finishTrial();  // the next iteration asks the analyzer for more, or ends the session
             const double usedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count();
             if (usedMs >= limitMs) break;     // keep the game responsive
@@ -940,10 +1011,11 @@ class $modify(FWPause, PauseLayer) {
 
         label("page " + std::to_string(mn.page + 1) + "/" + std::to_string(pages), "chatFont.fnt", 0.6f, 0.f, -70.f, ccc3(255, 255, 255), false);
         if (pages > 1) {
-            button("<", 0.45f, -60.f, -70.f, 0, menu_selector(FWPause::onMenuPrev));
-            button(">", 0.45f, 60.f, -70.f, 0, menu_selector(FWPause::onMenuNext));
+            button("<", 0.45f, -40.f, -70.f, 0, menu_selector(FWPause::onMenuPrev));
+            button(">", 0.45f, 40.f, -70.f, 0, menu_selector(FWPause::onMenuNext));
         }
         button("Off", 0.45f, 160.f, -70.f, 0, menu_selector(FWPause::onMenuOff));
+        button(Mod::get()->getSettingValue<bool>("fast-mode") ? "Fast (beta): ON" : "Fast (beta): OFF", 0.4f, -150.f, -70.f, 0, menu_selector(FWPause::onMenuFast));
     }
 
     int fwTag(CCObject* sender) { return static_cast<CCNode*>(sender)->getTag(); }
@@ -957,6 +1029,13 @@ class $modify(FWPause, PauseLayer) {
 
     void onMenuPrev(CCObject*) { --mn.page; fwBuildMenu(); }
     void onMenuNext(CCObject*) { ++mn.page; fwBuildMenu(); }
+
+    void onMenuFast(CCObject*) {
+        const bool now = !Mod::get()->getSettingValue<bool>("fast-mode");
+        Mod::get()->setSettingValue<bool>("fast-mode", now);
+        toast(now ? "Fast mode (beta) ON: hides the level, big physics chunks, shortcut probes" : "Fast mode OFF");
+        fwBuildMenu();
+    }
 
     void onMenuOff(CCObject*) {
         setWindowsMode(0);

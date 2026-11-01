@@ -46,6 +46,9 @@ struct AnalyzerSettings {
     int maxRunTicks = 240 * 180;  // hard stop for one run
     int maxWidth = 10;          // a window this wide is reported as "10+" and the next input is analysed (0 = off)
     bool useCheckpoints = true; // start each trial from a checkpoint taken at the previous input (needs the game side to support it)
+    // Fast mode (beta): once a few checkpoint runs reproduced the original timing, the original timing is trusted without a
+    // test; and if -4 and +5 (for maxWidth 10) both pass, the window is assumed to be 10+ without testing in between.
+    bool fastMode = false;
 };
 
 struct TrialSpec {
@@ -87,6 +90,7 @@ struct GroupReport {
     int refTick = -1;
     int endTick = -1;
     bool horizonCapped = false;
+    bool fastAssumed = false;     // fast mode: width assumed from the two extreme offsets
     bool usedCheckpoint = false;  // trials started from a checkpoint
     bool cpFallback = false;      // the checkpoint run did not reproduce the original timing, re-measured from the level start
     WindowResult w;
@@ -103,6 +107,9 @@ struct Report {
     bool refCompleted = false;
     bool refTimedOut = false;
     bool usedCheckpoints = false;
+    bool cpDisabled = false;    // checkpoint starts were abandoned after repeated mismatches
+    int cpOk = 0;               // inputs whose checkpoint start reproduced the original timing
+    int cpFallbacks = 0;        // inputs that had to be re-measured from the level start
     bool complete = false;      // every selected input was finished (not cancelled)
     int resumed = 0;            // inputs taken over from an earlier, interrupted analysis
     int cpCaptured = 0;
@@ -207,6 +214,30 @@ public:
                 rep.state = GroupState::Free;
                 rep.w = WindowResult{};
                 rep.w.trials = static_cast<int>(cur_->freeOffsets.size());
+                noteCheckpointOk();
+                cur_.reset();
+                continue;
+            }
+            if (cur_->extremeIdx < cur_->extremeOffsets.size()) {  // fast mode: the two extreme offsets first
+                pendingOffset_ = cur_->extremeOffsets[cur_->extremeIdx];
+                pendingSpec_ = buildTrial(pendingOffset_);
+                stage_ = Stage::WaitTrial;
+                return pendingSpec_;
+            }
+            if (cur_->extremeAllPass && !cur_->extremeOffsets.empty()) {  // both pass: assume everything in between does too
+                GroupReport& rep = report_.groups[cur_->group];
+                rep.w = WindowResult{};
+                rep.w.lo = cur_->extremeOffsets[1];
+                rep.w.hi = cur_->extremeOffsets[0];
+                rep.w.capped = true;
+                rep.w.capWidth = s_.maxWidth;
+                rep.w.clipHi = Limit::Cap;
+                rep.w.trials = static_cast<int>(cur_->extremeOffsets.size());
+                rep.fastAssumed = true;
+                rep.endTick = cur_->endTick;
+                rep.horizonCapped = cur_->capped;
+                rep.usedCheckpoint = cur_->cpTick >= 0 && !cur_->fellBack;
+                noteCheckpointOk();
                 cur_.reset();
                 continue;
             }
@@ -214,6 +245,11 @@ public:
             if (!off) {
                 if (cur_->usingCp && cur_->search.result().baseFailed) {
                     // the checkpoint run did not reproduce the original timing: measure this input from the level start instead
+                    ++report_.cpFallbacks;
+                    if (++cpFailStreak_ >= 2) {  // the checkpoint start is not faithful: stop trying it for the rest of the run
+                        cpDisabled_ = true;
+                        report_.cpDisabled = true;
+                    }
                     cur_->usingCp = false;
                     cur_->fellBack = true;
                     cur_->search = WindowSearch(cur_->cfg);
@@ -242,6 +278,12 @@ public:
                 cur_->freeAllPass = false;
                 cur_->freeIdx = cur_->freeOffsets.size();
             }
+        } else if (cur_->extremeIdx < cur_->extremeOffsets.size() && pendingOffset_ == cur_->extremeOffsets[cur_->extremeIdx]) {
+            ++cur_->extremeIdx;
+            if (v != Verdict::Pass) {  // narrower than maxWidth: measure it normally (the result so far is kept)
+                cur_->extremeAllPass = false;
+                cur_->extremeIdx = cur_->extremeOffsets.size();
+            }
         }
         pendingSpec_.reset();
         stage_ = Stage::Search;
@@ -262,6 +304,10 @@ private:
         std::vector<int> freeOffsets;  // release filter: +N then -N
         size_t freeIdx = 0;
         bool freeAllPass = true;
+        std::vector<int> extremeOffsets;  // fast mode: +b then -a, together >= maxWidth wide
+        size_t extremeIdx = 0;
+        bool extremeAllPass = true;
+        bool baseSeeded = false;
         SearchConfig cfg;
         WindowSearch search;
         Current(int g, int t, int e, bool c, int cp, const SearchConfig& config)
@@ -333,6 +379,13 @@ private:
             if (dir > 0) return -1;  // unreached: nothing to collide with
         }
         return -1;
+    }
+
+    void noteCheckpointOk() {
+        if (!cur_ || !cur_->usingCp) return;
+        cpFailStreak_ = 0;
+        ++report_.cpOk;
+        if (++cpOkCount_ >= 3) cpTrusted_ = true;
     }
 
     // Take over a finished input of an interrupted analysis (same number AND same x).
@@ -452,11 +505,26 @@ private:
         rep.y = (T < static_cast<int>(ys_.size())) ? ys_[T] : 0.0;
         rep.endTick = end;
         rep.horizonCapped = capped;
-        const int cpTick = (s_.useCheckpoints && prevT >= 0 && cpTicks_.count(prevT)) ? prevT : -1;
+        // the checkpoint taken at the previous input of the original macro, or the closest earlier one that exists
+        int cpTick = -1;
+        if (s_.useCheckpoints && !cpDisabled_ && prevT >= 0) {
+            auto it = cpTicks_.upper_bound(prevT);
+            if (it != cpTicks_.begin()) cpTick = *--it;
+        }
         cur_ = std::make_unique<Current>(gi, T, end, capped, cpTick, cfg);
         if (s_.skipFreeReleases && gs_.groups[gi].kind == GroupKind::Release) {
             const int n = std::max(1, s_.freeReleaseTicks);
             if (cfg.rangeHi >= n && cfg.rangeLo <= -n) cur_->freeOffsets = {n, -n};  // can only conclude if both are reachable
+        }
+        if (s_.fastMode) {
+            if (cur_->usingCp && cpTrusted_) {  // calibrated: the checkpoint start has reproduced the original timing before
+                cur_->search.submit(0, Verdict::Pass);
+                cur_->baseSeeded = true;
+            }
+            if (s_.maxWidth > 1 && !s_.thorough) {
+                const int b = s_.maxWidth / 2, a = s_.maxWidth - 1 - b;
+                if (cfg.rangeHi >= b && cfg.rangeLo <= -a) cur_->extremeOffsets = {b, -a};
+            }
         }
     }
 
@@ -468,6 +536,7 @@ private:
         rep.horizonCapped = cur_->capped;
         rep.usedCheckpoint = cur_->cpTick >= 0 && !cur_->fellBack;
         rep.cpFallback = cur_->fellBack;
+        if (cur_->usingCp && !cur_->baseSeeded) noteCheckpointOk();
         cur_.reset();
     }
 
@@ -512,6 +581,10 @@ private:
     Stage stage_ = Stage::NeedReference;
     std::vector<PriorRow> prior_;
     std::set<int> cpTicks_;
+    bool cpDisabled_ = false;
+    bool cpTrusted_ = false;
+    int cpFailStreak_ = 0;
+    int cpOkCount_ = 0;
     std::vector<double> xs_, ys_;
     std::vector<int> refFire_;
     int refDeath_ = -1;
