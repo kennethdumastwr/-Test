@@ -71,8 +71,8 @@ namespace {
         bool hidden = false;         // level hidden while analysing (fast mode)
         int fireSeenTick = -1;       // last tick index in which inputs fired
         double simSeconds = 0.0;     // game seconds simulated (for the measured TPS)
-        int cpRestoreFails = 0;      // consecutive failed checkpoint restores
         bool cpGiveUp = false;
+        bool noCapture = false;      // taking a checkpoint was refused (not practice mode ...): no checkpoints this run
 #ifndef FW_NO_CHECKPOINTS
         std::map<int, double> cpX;   // player x when each checkpoint was taken (verifies a restore really landed there)
 #endif
@@ -430,16 +430,21 @@ namespace {
 
     // ---------------------------------------------------------------- session control
 
+    // Our references to the practice checkpoints we placed. They MUST outlive the game's own bookkeeping of them: free them only
+    // after the level was restarted from the start (that removes the checkpoint objects from the level), never before.
+    void releaseCheckpoints() {
+#ifndef FW_NO_CHECKPOINTS
+        g.cps.clear();
+        g.cpX.clear();
+#endif
+    }
+
     void endSession(PlayLayer* pl, bool showReport, bool restartLevel) {
         g.phase = Phase::Idle;
         if (g.hidden) {
             if (PlayLayer* cur = PlayLayer::get()) cur->setVisible(true);
             g.hidden = false;
         }
-#ifndef FW_NO_CHECKPOINTS
-        g.cps.clear();
-        g.cpX.clear();
-#endif
         g.trialActive = false;
         removeLabel();
 
@@ -483,8 +488,9 @@ namespace {
         g.analyzer.reset();
         if (restartLevel && pl) {
             g.resettingByUs = true;
-            pl->resetLevelFromStart();
+            pl->resetLevelFromStart();  // the game removes ITS practice checkpoints (and their objects in the level) here
             g.resettingByUs = false;
+            releaseCheckpoints();       // only now may our references to them go
         }
     }
 
@@ -497,34 +503,54 @@ namespace {
     void injectFires(GJBaseGameLayer* layer, const std::vector<fw::Fire>& fires);
 
 #ifndef FW_NO_CHECKPOINTS
-    // Start a trial from a checkpoint the way the game itself does it in practice mode: make it the last checkpoint and respawn.
-    // The player must really land at the x it had when the checkpoint was taken, otherwise the restore does not count.
-    bool restoreCheckpoint(PlayLayer* pl, int tick) {
+    // Place a real practice checkpoint (between updates, like pressing the practice button). `ticksRun` = ticks already run (0 = level start).
+    bool captureCheckpointNow(PlayLayer* pl, int ticksRun) {
+        if (g.noCapture) return false;
+        CCArray* arr = pl->m_checkpointArray;
+        if (!arr) { g.noCapture = true; return false; }
+        const unsigned int before = arr->count();
+        pl->markCheckpoint();
+        if (arr->count() <= before) { g.noCapture = true; return false; }  // refused (not in practice mode ...): no checkpoints this run
+        auto cp = static_cast<CheckpointObject*>(arr->lastObject());
+        g.cps[ticksRun] = cp;
+        g.cpX[ticksRun] = playerX(pl->m_player1);
+        g.res.checkpointAt.push_back(ticksRun);
+        return true;
+    }
+
+    // Start a trial from a checkpoint the way the game does it in practice mode: the checkpoint becomes the LAST one and the level
+    // respawns. The game's checkpoint list is never emptied or replaced (only reordered): the game must keep owning every checkpoint
+    // object it placed in the level. The player must really land at the x it had when the checkpoint was taken.
+    bool restoreCheckpoint(PlayLayer* pl, int ticksRun) {
         if (g.cpGiveUp) return false;
-        auto it = g.cps.find(tick);
+        auto it = g.cps.find(ticksRun);
         if (it == g.cps.end() || !it->second) return false;
-        const double want = g.cpX.count(tick) ? g.cpX[tick] : -1.0;
+        CheckpointObject* cp = it->second;
+        CCArray* arr = pl->m_checkpointArray;
+        if (!arr || !arr->containsObject(cp)) {  // the game dropped it (a from-start restart wipes them): never touch such an object
+            g.cpGiveUp = true;
+            return false;
+        }
+        const double want = g.cpX.count(ticksRun) ? g.cpX[ticksRun] : -1.0;
         auto landed = [&] { return want < 0.0 || std::fabs(playerX(pl->m_player1) - want) < 0.05; };
 
-        bool ok = false;
         g.resettingByUs = true;
-        if (CCArray* arr = pl->m_checkpointArray) {
-            arr->removeAllObjects();
-            arr->addObject(it->second);
-            pl->resetLevel();  // practice-mode respawn = load the last checkpoint + all the resets the game does around it
-            ok = landed();
-        }
+        cp->retain();
+        arr->removeObject(cp);  // same object, moved to the end
+        arr->addObject(cp);
+        cp->release();
+        pl->resetLevel();  // practice-mode respawn = load the last checkpoint + all the resets the game does around it
+        bool ok = landed();
         if (!ok) {
-            pl->loadFromCheckpoint(it->second);  // second way: the raw load
+            pl->loadFromCheckpoint(cp);  // second way: the raw load
             ok = landed();
         }
         g.resettingByUs = false;
 
         if (ok) {
-            g.cpRestoreFails = 0;
             ++g.cpRestores;
-        } else if (++g.cpRestoreFails >= 3) {
-            g.cpGiveUp = true;  // stop paying for restores that do not land
+        } else {
+            g.cpGiveUp = true;  // the restart below wipes all practice checkpoints anyway
         }
         return ok;
     }
@@ -549,19 +575,23 @@ namespace {
 
         bool restored = false;
 #ifndef FW_NO_CHECKPOINTS
-        if (g.spec.checkpointTick >= 0) {
-            restored = restoreCheckpoint(pl, g.spec.checkpointTick);
-            if (restored) g.tick = g.spec.checkpointTick + 1;  // state at the end of that tick: ticks stay absolute
+        if (g.spec.startAt >= 0) {
+            restored = restoreCheckpoint(pl, g.spec.startAt);
+            if (restored) g.tick = g.spec.startAt;  // ticks stay absolute
         }
 #endif
         if (!restored) {
 #ifndef FW_NO_CHECKPOINTS
-            if (g.spec.checkpointTick >= 0) ++g.cpMissing;
+            if (g.spec.startAt >= 0) ++g.cpMissing;
+            if (!g.spec.captureCheckpoints && !g.cps.empty()) g.cpGiveUp = true;  // the restart below wipes every practice checkpoint
 #endif
             g.tick = 0;
             g.resettingByUs = true;
             pl->resetLevelFromStart();
             g.resettingByUs = false;
+#ifndef FW_NO_CHECKPOINTS
+            if (g.spec.captureCheckpoints) captureCheckpointNow(pl, 0);  // the level start is a checkpoint too: the first input needs one
+#endif
         }
 
         // nothing may stay held from the previous trial; then continue the macro from the player's position
@@ -585,22 +615,12 @@ namespace {
         return std::clamp(remaining, 1, 120);
     }
 
-    // Place a real practice checkpoint BETWEEN updates (like pressing the practice button), never in the middle of a physics step.
+    // Checkpoints are taken BETWEEN updates, never in the middle of a physics step.
     void captureCheckpointAfterUpdate(PlayLayer* pl) {
 #ifndef FW_NO_CHECKPOINTS
         if (!g.spec.captureCheckpoints || g.tick <= 0) return;
         if (g.fireSeenTick != g.tick - 1) return;  // inputs fired earlier in a multi-tick update: that exact state is gone
-        CCArray* arr = pl->m_checkpointArray;
-        const unsigned int before = arr ? arr->count() : 0;
-        pl->markCheckpoint();
-        CheckpointObject* cp = nullptr;
-        if (arr && arr->count() > before) cp = static_cast<CheckpointObject*>(arr->lastObject());
-        if (!cp) cp = pl->createCheckpoint();  // invisible snapshot as a last resort
-        if (cp) {
-            g.cps[g.tick - 1] = cp;
-            g.cpX[g.tick - 1] = playerX(pl->m_player1);
-            g.res.checkpointTicks.push_back(g.tick - 1);
-        }
+        captureCheckpointNow(pl, g.tick);
 #else
         (void)pl;
 #endif
@@ -688,8 +708,8 @@ namespace {
         g.budgetMs = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("frame-budget-ms")), 4, 40);
         g.cpRestores = 0;
         g.cpMissing = 0;
-        g.cpRestoreFails = 0;
         g.cpGiveUp = false;
+        g.noCapture = false;
         g.simSeconds = 0.0;
         g.fast = mod->getSettingValue<bool>("fast-mode");
         g.eps = mod->getSettingValue<double>("x-epsilon");
@@ -708,9 +728,13 @@ namespace {
 #else
         settings.useCheckpoints = settings.useCheckpoints && pl->m_isPracticeMode;  // checkpoints are a practice-mode feature
 #endif
-#ifndef FW_NO_CHECKPOINTS
-        g.cps.clear();
-#endif
+        if (g.pendingRestart) {  // checkpoints of a cancelled run are still in the level: let the game remove them first
+            g.pendingRestart = false;
+            g.resettingByUs = true;
+            pl->resetLevelFromStart();
+            g.resettingByUs = false;
+        }
+        releaseCheckpoints();
         if (g.fast) toast("Fast mode (beta): level hidden while analysing");
         if (settings.useCheckpoints) toast("Practice mode: checkpoint analysis (your own checkpoints get cleared)");
         else if (readSettings().useCheckpoints) toast("Not in practice mode: analysing from the level start (slower)", NotificationIcon::Warning);
@@ -805,6 +829,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             g.resettingByUs = true;
             pl->resetLevelFromStart();
             g.resettingByUs = false;
+            releaseCheckpoints();  // the game just removed its checkpoints with the restart
         }
         refreshOverlay(pl);
         updateOverlayProgress(pl);
@@ -906,6 +931,7 @@ class $modify(FWPlayLayer, PlayLayer) {
         pb.active = false;
         pb.key.clear();
         PlayLayer::onQuit();
+        releaseCheckpoints();  // after the level is gone, never before
     }
 };
 
