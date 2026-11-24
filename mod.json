@@ -16,6 +16,12 @@
       "name": "Scan",
       "type": "title"
     },
+    "pair-clicks": {
+      "name": "Click + release together",
+      "description": "A click and its release are ONE unit: both are moved by the same number of ticks in every trial and get one window (taps that join two clicks move together). Off = the old method: every press and release is analysed on its own.",
+      "type": "bool",
+      "default": true
+    },
     "scan-radius": {
       "name": "Scan radius (ticks)",
       "description": "Maximum ticks tested on each side of the recorded input.",
@@ -189,6 +195,18 @@
         "slider": false
       }
     },
+    "tick-mode": {
+      "name": "Tick counting",
+      "description": "What counts as one physics tick. 0 = AUTO: measured before every analysis (recommended). 1 = every physics step, 2 = only full ticks (skips the half ticks). If windows look 4x too small, the wrong one was used.",
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 2,
+      "control": {
+        "input": true,
+        "slider": true
+      }
+    },
     "x-epsilon": {
       "name": "X tolerance",
       "description": "Playback fires an input when player x >= action x - this value.",
@@ -228,6 +246,24 @@
       "description": "Write <macro>.windows.txt and .csv to this mod's save folder under results/.",
       "type": "bool",
       "default": true
+    },
+    "auto-make-macro": {
+      "name": "Make a macro after analysing",
+      "description": "When an analysis finishes, save a NEW macro in the percent-macro folder with every click moved inside its frame window (the original is never changed). The menu Make button does the same later.",
+      "type": "bool",
+      "default": true
+    },
+    "macro-pick": {
+      "name": "Click placement in the window",
+      "description": "0 = center of the window (safest), 1 = earliest tick, 2 = latest tick. Clicks that are 10+ wide, unstable or not analysed keep their recorded timing.",
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 2,
+      "control": {
+        "input": true,
+        "slider": true
+      }
     },
     "settings-button": {
       "name": "Settings button",
