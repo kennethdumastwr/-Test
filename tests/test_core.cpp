@@ -8,6 +8,7 @@
 
 #include "../src/analyzer.hpp"
 #include "../src/playback.hpp"
+#include "../src/makemacro.hpp"
 #include "../src/overlay.hpp"
 #include "../src/report.hpp"
 
@@ -283,6 +284,8 @@ static TrialResult runFake(const FakeLevel& lv, const TrialSpec& spec) {
     return r;
 }
 
+static AnalyzerSettings legacySettings() { AnalyzerSettings s; s.pairClicks = false; return s; }
+
 static std::string macroText(const std::vector<std::tuple<int, int, int>>& evs, double speed = 1.298245) {
     // (tick, down, p2)  ->  x = tick * speed, exactly what the fake player has at that tick
     std::ostringstream o;
@@ -321,7 +324,7 @@ static void testAnalyzer() {
     lv.rules[8] = {299, 301, 0};    // P@300 -> [-1,+1]
 
     SECTION("analyzer end-to-end on the fake game");
-    AnalyzerSettings st;
+    AnalyzerSettings st; st.pairClicks = false;
     st.radius = 8;
     st.maxWidth = 0;          // these older checks measure the full window
     st.useCheckpoints = false;
@@ -346,7 +349,7 @@ static void testAnalyzer() {
     CHECK(gl && gl->w.lo == -1 && gl->w.hi == 1);
     auto g0 = byNumber(a, 1);     // release at x=0, nothing held
     CHECK(g0 && g0->state == GroupState::Redundant);
-    std::printf("  total trials: %d for %zu inputs\n", trials, a.groups().groups.size());
+    std::printf("  total trials: %d for %zu inputs\n", trials, a.unitSet().units.size());
     {
         ReportStyle rs;
         std::string txt = formatReport(a, rs, "fake.txt");
@@ -378,9 +381,9 @@ static void testAnalyzer() {
         MacroFile m2 = parseMacro(macroText({{100, 1, 0}, {400, 0, 0}}));
         FakeLevel lv2;
         lv2.rules[0] = {98, 100, 30};  // pressing early kills 30 ticks later
-        AnalyzerSettings sShort; sShort.radius = 8; sShort.maxWidth = 0; sShort.useCheckpoints = false; sShort.horizonMinTicks = 10; sShort.horizonGroups = 0;
+        AnalyzerSettings sShort; sShort.pairClicks = false; sShort.radius = 8; sShort.maxWidth = 0; sShort.useCheckpoints = false; sShort.horizonMinTicks = 10; sShort.horizonGroups = 0;
         Analyzer a1(m2, sShort); drive(&a1, lv2);
-        AnalyzerSettings sLong; sLong.radius = 8; sLong.maxWidth = 0; sLong.useCheckpoints = false; sLong.horizonMinTicks = 60; sLong.horizonGroups = 0;
+        AnalyzerSettings sLong; sLong.pairClicks = false; sLong.radius = 8; sLong.maxWidth = 0; sLong.useCheckpoints = false; sLong.horizonMinTicks = 60; sLong.horizonGroups = 0;
         Analyzer a2(m2, sLong); drive(&a2, lv2);
         const GroupReport* s1 = byNumber(a1, 1); const GroupReport* s2 = byNumber(a2, 1);
         CHECK(s1 && s2);
@@ -459,7 +462,7 @@ static void testRealMacroSmoke() {
     FakeLevel lv;
     lv.speed = 1.2982;  // refX never equals recorded x exactly here; eps handles it
     // constrain every real input to [T-2, T+2] where T is the tick the reference fires it on
-    Analyzer probe(m, AnalyzerSettings{});
+    Analyzer probe(m, legacySettings());
     // first, learn reference fire ticks with an unconstrained level
     TrialSpec s0 = *probe.nextTrial();
     TrialResult ref = runFake(lv, s0);
@@ -468,7 +471,7 @@ static void testRealMacroSmoke() {
         int T = ref.firedTick[g.actions[0]];
         lv.rules[g.actions[0]] = {T - 2, T + 2, 0};
     }
-    Analyzer a(m, AnalyzerSettings{});
+    Analyzer a(m, legacySettings());
     int trials = 0;
     drive(&a, lv, &trials);
     int analysed = 0, wrong = 0;
@@ -492,7 +495,7 @@ static void testHorizonFreeResume() {
         MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}}));
         FakeLevel lv;
         lv.rules[0] = {98, 100, 40};  // pressing early kills 40 ticks later, i.e. AFTER the release at tick 130
-        AnalyzerSettings d; d.radius = 8; d.maxWidth = 0; d.useCheckpoints = false; d.skipFreeReleases = false;
+        AnalyzerSettings d; d.pairClicks = false; d.radius = 8; d.maxWidth = 0; d.useCheckpoints = false; d.skipFreeReleases = false;
         Analyzer a(m, d); drive(&a, lv);
         const GroupReport* g = byNumber(a, 1);
         CHECK(g && g->endTick == 130);
@@ -516,7 +519,7 @@ static void testHorizonFreeResume() {
         lv.rules[2] = {298, 302, 0};
         lv.rules[3] = {303, 306, 0};      // release 4 ticks after the press: -10 is not reachable, so no probe
         lv.rules[4] = {399, 401, 0};
-        AnalyzerSettings st; st.radius = 10; st.maxWidth = 0; st.useCheckpoints = false;
+        AnalyzerSettings st; st.pairClicks = false; st.radius = 10; st.maxWidth = 0; st.useCheckpoints = false;
         Analyzer a(m, st); drive(&a, lv);
         auto rel = byNumber(a, 2);
         CHECK(rel && rel->state == GroupState::Free && rel->w.trials == 2);
@@ -541,7 +544,7 @@ static void testHorizonFreeResume() {
         for (int i = 0; i < 12; ++i) { ev.push_back({200 + i * 120, 1, 0}); ev.push_back({240 + i * 120, 0, 0}); }
         for (int i = 0; i < 12; ++i) { lv.rules[2 * i] = {198 + i * 120, 202 + i * 120, 0}; lv.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0}; }
         MacroFile m = parseMacro(macroText(ev));
-        AnalyzerSettings st; st.useCheckpoints = false; st.maxWidth = 0; st.skipFreeReleases = false;
+        AnalyzerSettings st; st.pairClicks = false; st.useCheckpoints = false; st.maxWidth = 0; st.skipFreeReleases = false;
 
         Analyzer full(m, st); drive(&full, lv);
         CHECK(full.report().complete);
@@ -605,13 +608,13 @@ static void testCapAndCheckpoints() {
         FakeLevel lv;
         lv.rules[0] = {80, 125, 0};   // 46 ticks wide
         lv.rules[1] = {198, 202, 0};
-        AnalyzerSettings st; st.radius = 20; st.useCheckpoints = false;   // maxWidth 10 is the default
+        AnalyzerSettings st; st.pairClicks = false; st.radius = 20; st.useCheckpoints = false;   // maxWidth 10 is the default
         Analyzer a(m, st); int n = 0; drive(&a, lv, &n);
         auto g0 = byNumber(a, 1); auto g1 = byNumber(a, 2);
         CHECK(g0 && g0->w.capped && g0->w.width() == 10);
         CHECK(g1 && !g1->w.capped && g1->w.lo == -2 && g1->w.hi == 2);
         const char* tagDummy = nullptr;
-        CHECK(formatLine(a.groups(), *g0, ReportStyle{}, tagDummy).find("10+F") != std::string::npos);
+        CHECK(formatLine(a.unitSet().units[g0->group], *g0, ReportStyle{}, tagDummy).find("10+F") != std::string::npos);
         std::printf("  trials with cap: %d\n", n);
     }
 
@@ -622,7 +625,7 @@ static void testCapAndCheckpoints() {
         for (int i = 0; i < 12; ++i) { ev.push_back({200 + i * 120, 1, 0}); ev.push_back({240 + i * 120, 0, 0}); }
         for (int i = 0; i < 12; ++i) { lv.rules[2 * i] = {198 + i * 120, 202 + i * 120, 0}; lv.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0}; }
         MacroFile m = parseMacro(macroText(ev));
-        AnalyzerSettings off; off.useCheckpoints = false; off.maxWidth = 0;
+        AnalyzerSettings off; off.pairClicks = false; off.useCheckpoints = false; off.maxWidth = 0;
         AnalyzerSettings on = off; on.useCheckpoints = true;
         Analyzer a0(m, off); lv.ticksSimulated = 0; drive(&a0, lv); long long ticksOff = lv.ticksSimulated;
         Analyzer a1(m, on);  lv.ticksSimulated = 0; drive(&a1, lv); long long ticksOn = lv.ticksSimulated;
@@ -667,6 +670,239 @@ static void testCapAndCheckpoints() {
     }
 }
 
+static void testMakeMacro() {
+    SECTION("pick offsets: center / earliest / latest");
+    CHECK(pickOffset(-2, 1, PickMode::Center) == 0);          // equally central ticks -> the one closer to the recorded timing
+    CHECK(pickOffset(-3, 1, PickMode::Center) == -1);
+    CHECK(pickOffset(0, 4, PickMode::Center) == 2);
+    CHECK(pickOffset(-5, 0, PickMode::Center) == -2);
+    CHECK(pickOffset(-2, 3, PickMode::Earliest) == -2 && pickOffset(-2, 3, PickMode::Latest) == 3);
+
+    SECTION("make macro: every click goes to the middle of its window and the new macro still passes");
+    {
+        // click windows (ticks): P@100 [-2,+3] with R@130 [-3,+1] -> click [-2,+1] ; P@200 [-3,+5] with R@240 [-6,+5] -> click [-3,+5]
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}, {200, 1, 0}, {240, 0, 0}}));
+        FakeLevel lv;
+        lv.rules[0] = {98, 103, 0}; lv.rules[1] = {127, 131, 0};
+        lv.rules[2] = {197, 205, 0}; lv.rules[3] = {234, 245, 0};
+        AnalyzerSettings st; st.radius = 8; st.maxWidth = 0; st.useCheckpoints = false;
+        Analyzer a(m, st); drive(&a, lv);
+        auto c1 = byNumber(a, 1); auto c2 = byNumber(a, 3);
+        CHECK(c1 && c1->w.lo == -2 && c1->w.hi == 1 && c2 && c2->w.lo == -3 && c2->w.hi == 5);
+
+        auto center = a.pickedActions(PickMode::Center);
+        // click 1: offset 0 (equally central -> recorded timing), click 2: offset +1
+        CHECK(std::fabs(center[0].x - 100 * lv.speed) < 1e-9 && std::fabs(center[1].x - 130 * lv.speed) < 1e-9);
+        CHECK(std::fabs(center[2].x - 201 * lv.speed) < 1e-9 && std::fabs(center[3].x - 241 * lv.speed) < 1e-9);   // BOTH moved by the same +1
+        auto early = a.pickedActions(PickMode::Earliest);
+        CHECK(std::fabs(early[0].x - 98 * lv.speed) < 1e-9 && std::fabs(early[1].x - 128 * lv.speed) < 1e-9);       // click 1 two ticks earlier, release too
+        auto late = a.pickedActions(PickMode::Latest);
+        CHECK(std::fabs(late[2].x - 205 * lv.speed) < 1e-9 && std::fabs(late[3].x - 245 * lv.speed) < 1e-9);
+
+        // the generated macro, written to text and read back, replays without dying
+        std::string text = formatMacroText(a.macro(), center, "test");
+        MacroFile back = parseMacro(text);
+        CHECK(back.ok() && back.actions.size() == 4 && back.errors.empty());
+        for (size_t i = 0; i < 4; ++i) CHECK(std::fabs(back.actions[i].x - center[i].x) < 1e-9 && back.actions[i].down == center[i].down);
+        TrialSpec spec; spec.actions = back.actions; spec.endTick = 300; spec.maxTick = 400;
+        TrialResult r = runFake(lv, spec);
+        CHECK(!r.died);
+        for (auto mode : {PickMode::Earliest, PickMode::Latest}) {
+            TrialSpec s2; s2.actions = a.pickedActions(mode); s2.endTick = 300; s2.maxTick = 400;
+            CHECK(!runFake(lv, s2).died);                         // even the extreme picks stay inside the windows
+        }
+    }
+
+    SECTION("make macro: clicks without a trustworthy window keep their recorded timing");
+    {
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}, {200, 1, 0}, {240, 0, 0}}));
+        FakeLevel lv; lv.rules[0] = {98, 130, 0};   // click 1 is 10+ wide
+        lv.rules[2] = {197, 205, 0};
+        AnalyzerSettings st; st.radius = 20; st.useCheckpoints = false;      // maxWidth 10 -> "10+"
+        Analyzer a(m, st); drive(&a, lv);
+        CHECK(byNumber(a, 1)->w.capped);
+        auto picked = a.pickedActions(PickMode::Earliest);
+        CHECK(std::fabs(picked[0].x - 100 * lv.speed) < 1e-9);   // 10+ is not touched
+    }
+
+    SECTION("pick table: saved next to the results, a macro can be made later");
+    {
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}}));
+        FakeLevel lv; lv.rules[0] = {97, 103, 0}; lv.rules[1] = {126, 133, 0};
+        AnalyzerSettings st; st.radius = 8; st.maxWidth = 0; st.useCheckpoints = false;
+        Analyzer a(m, st); drive(&a, lv);
+        std::vector<PickRow> rows; 
+        CHECK(parsePickTable(formatPickTable(a.pickTable()), rows) && rows.size() == 2);
+        std::vector<MacroAction> viaTable, direct = a.pickedActions(PickMode::Earliest);
+        MacroFile mm = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}}));
+        CHECK(applyPicks(mm, rows, PickMode::Earliest, viaTable));
+        CHECK(viaTable.size() == direct.size() && std::fabs(viaTable[0].x - direct[0].x) < 1e-6 && std::fabs(viaTable[1].x - direct[1].x) < 1e-6);
+        MacroFile other = parseMacro(macroText({{300, 1, 0}, {330, 0, 0}}));
+        CHECK(!applyPicks(other, rows, PickMode::Center, viaTable));          // a different macro is refused
+        CHECK(!parsePickTable("id,x\n0,1,2\n", rows));
+    }
+
+    SECTION("percent column follows the moved x, file ordering stays valid");
+    {
+        MacroFile m = parseMacro(slurp("tests/spamy_wVs.txt"));
+        std::vector<MacroAction> moved = m.actions;
+        moved[52].x += 1.298;                                  // action #53: one tick later
+        std::string text = formatMacroText(m, moved, "x");
+        MacroFile back = parseMacro(text);
+        CHECK(back.ok() && back.actions.size() == 138 && !back.wasUnsorted && back.levelName == "spamy_wVs");
+        CHECK(std::fabs(back.actions[52].x - moved[52].x) < 1e-9);
+        CHECK(back.actions[52].percent > m.actions[52].percent && back.actions[52].percent - m.actions[52].percent < 0.1);
+    }
+
+    SECTION("report: windows also in 60 fps frames");
+    {
+        MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}}));
+        FakeLevel lv; lv.rules[0] = {98, 103, 0}; lv.rules[1] = {127, 131, 0};
+        AnalyzerSettings st; st.radius = 8; st.maxWidth = 0; st.useCheckpoints = false;
+        Analyzer a(m, st); drive(&a, lv);
+        std::string txt = formatReport(a, ReportStyle{}, "x");
+        CHECK(txt.find("[-2,+1] 4F =1.00F@60") != std::string::npos);        // 4 ticks at 240 = ONE frame at 60 fps
+    }
+}
+
+static void testPairs() {
+    SECTION("units: real macro = 64 clicks + 1 chain + 6 no-ops");
+    {
+        MacroFile m = parseMacro(slurp("tests/spamy_wVs.txt"));
+        GroupSet gs = buildGroups(m.actions);
+        UnitSet us = buildUnits(gs, m.actions, true);
+        int k[5] = {0, 0, 0, 0, 0};
+        for (auto& u : us.units) ++k[(int)u.kind];
+        CHECK(us.units.size() == 71 && k[(int)UnitKind::NoOp] == 6 && k[(int)UnitKind::Click] == 64 && k[(int)UnitKind::Chain] == 1);
+        const Unit* chain = nullptr;
+        for (auto& u : us.units) if (u.kind == UnitKind::Chain) chain = &u;
+        CHECK(chain && chain->number == 40 && chain->lastNumber == 43 && chain->clicks == 2 && chain->groups.size() == 3);
+        UnitSet legacy = buildUnits(gs, m.actions, false);
+        CHECK(legacy.units.size() == 137);                                  // one unit per same-x group, as before
+        CHECK(numbersText(*chain) == "#40-43" && unitKindName(*chain) == "chain(2)");
+    }
+    SECTION("units: players are separate, hold at the end, flick, no-op in between");
+    {
+        MacroFile m = parseMacro("10 0 1 0\n20 0 1 1\n30 0 0 0\n40 0 1 0\n40 0 0 0\n50 0 1 0\n55 0 1 0\n60 0 0 1\n");
+        GroupSet gs = buildGroups(m.actions);
+        UnitSet us = buildUnits(gs, m.actions, true);
+        int clicks = 0, holds = 0, noops = 0;
+        for (auto& u : us.units) { clicks += u.kind == UnitKind::Click; holds += u.kind == UnitKind::Hold; noops += u.kind == UnitKind::NoOp; }
+        CHECK(clicks == 3 && holds == 1 && noops == 1);
+        CHECK(us.byPlayer[0].size() + us.byPlayer[1].size() == us.units.size());
+    }
+
+    // a click = press + release; ids: 0 P@100  1 R@130 | 2 P@200  3 R@240
+    MacroFile m = parseMacro(macroText({{100, 1, 0}, {130, 0, 0}, {200, 1, 0}, {240, 0, 0}}));
+    FakeLevel lv;
+    lv.rules[0] = {98, 103, 0};     // press   -> [-2,+3]
+    lv.rules[1] = {127, 131, 0};    // release -> [-3,+1]    => the click can move [-2,+1] together
+    lv.rules[2] = {197, 201, 0};    // [-3,+1]
+    lv.rules[3] = {238, 243, 0};    // [-2,+3]               => [-2,+1]
+    AnalyzerSettings st; st.radius = 8; st.maxWidth = 0; st.useCheckpoints = false;
+
+    SECTION("pairs: press and release get the SAME offset in every trial, one window per click");
+    {
+        Analyzer a(m, st);
+        int shifted = 0; bool sameOffset = true;
+        while (auto spec = a.nextTrial()) {
+            if (!spec->recordX) {
+                double dp = 0, dr = 0;
+                for (auto& act : spec->actions) {
+                    if (act.id == 0) dp = act.x - 100 * lv.speed;
+                    if (act.id == 1) dr = act.x - 130 * lv.speed;
+                }
+                const bool moved = std::fabs(dp) > 1e-9 || std::fabs(dr) > 1e-9;
+                const bool unit1 = spec->endTick <= 200;  // trials of the first click end when the next click starts
+                if (moved && unit1) { ++shifted; if (std::fabs(dp - dr) > 1e-9) sameOffset = false; }
+            }
+            a.submit(runFake(lv, *spec));
+        }
+        CHECK(shifted > 0 && sameOffset);
+        CHECK(a.unitSet().units.size() == 2);
+        auto c1 = byNumber(a, 1); auto c2 = byNumber(a, 3);
+        CHECK(c1 && c1->w.lo == -2 && c1->w.hi == 1 && c1->w.width() == 4 && c1->holdTicks == 30);
+        CHECK(c2 && c2->w.lo == -2 && c2->w.hi == 1 && c2->holdTicks == 40);
+        CHECK(c1->endTick == 200);                                      // survive until the NEXT click starts
+        const char* tag = nullptr;
+        std::string line = formatLine(a.unitSet().units[c1->group], *c1, ReportStyle{}, tag);
+        CHECK(line.find("#1-2 click (hold 30t)") != std::string::npos && line.find("[-2,+1] 4F") != std::string::npos);
+        SavedResults sr = parseResultsCsv(formatCsv(a, 240));
+        CHECK(sr.items.size() == 2 && sr.items[0].width == 4 && std::fabs(sr.items[0].x - 100 * lv.speed) < 1e-3);   // marker sits on the click
+    }
+
+    SECTION("pairs: a tap joins two clicks into one chain that moves as a whole");
+    {
+        MacroFile mc = parseMacro(macroText({{100, 1, 0}, {140, 0, 0}, {140, 1, 0}, {180, 0, 0}}));
+        FakeLevel l2;
+        l2.rules[0] = {98, 103, 0};      // [-2,+3]
+        l2.rules[1] = {138, 142, 0};     // [-2,+2]
+        l2.rules[3] = {177, 181, 0};     // [-3,+1]
+        Analyzer a(mc, st); drive(&a, l2);
+        CHECK(a.unitSet().units.size() == 1 && a.unitSet().units[0].kind == UnitKind::Chain);
+        CHECK(a.report().groups[0].w.lo == -2 && a.report().groups[0].w.hi == 1);
+    }
+
+    SECTION("pairs: neighbours clamp the whole click");
+    {
+        MacroFile mn = parseMacro(macroText({{100, 1, 0}, {110, 0, 0}, {112, 1, 0}, {130, 0, 0}}));
+        FakeLevel l3;
+        Analyzer a(mn, st); drive(&a, l3);
+        auto u1 = byNumber(a, 1); auto u2 = byNumber(a, 3);
+        CHECK(u1 && u1->w.hi == 1 && u1->w.clipHi == Limit::Neighbor);     // release at 110 may reach 111, not 112
+        CHECK(u2 && u2->w.lo == -1 && u2->w.clipLo == Limit::Neighbor);    // press at 112 may reach 111, not 110
+    }
+
+    SECTION("pairs: a press that is never released is a hold");
+    {
+        MacroFile mh = parseMacro(macroText({{100, 1, 0}}));
+        FakeLevel l4; l4.rules[0] = {98, 103, 0};
+        Analyzer a(mh, st); drive(&a, l4);
+        CHECK(a.unitSet().units[0].kind == UnitKind::Hold && a.report().groups[0].w.lo == -2 && a.report().groups[0].w.hi == 3);
+    }
+
+    SECTION("pairs: the free-release filter only exists for the per-input method");
+    {
+        MacroFile mf = parseMacro(macroText({{100, 1, 0}, {200, 0, 0}, {300, 1, 0}, {400, 0, 0}}));
+        FakeLevel l5; l5.rules[0] = {98, 102, 0}; l5.rules[2] = {298, 302, 0};
+        Analyzer a(mf, st); drive(&a, l5);
+        for (auto& g : a.report().groups) CHECK(g.state != GroupState::Free);
+        AnalyzerSettings per = st; per.pairClicks = false; per.radius = 10;   // the probes are +-10
+        Analyzer b(mf, per); drive(&b, l5);
+        CHECK(byNumber(b, 2)->state == GroupState::Free);
+    }
+
+    SECTION("pairs: resume + checkpoints work on units");
+    {
+        std::vector<std::tuple<int, int, int>> ev; FakeLevel lvp;
+        for (int i = 0; i < 12; ++i) { ev.push_back({200 + i * 120, 1, 0}); ev.push_back({240 + i * 120, 0, 0}); }
+        for (int i = 0; i < 12; ++i) { lvp.rules[2 * i] = {198 + i * 120, 202 + i * 120, 0}; lvp.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0}; }
+        MacroFile mp = parseMacro(macroText(ev));
+        AnalyzerSettings off; off.useCheckpoints = false; off.maxWidth = 0;
+        AnalyzerSettings on = off; on.useCheckpoints = true;
+        off.pairClicks = true; on.pairClicks = true;
+        Analyzer a0(mp, off); lvp.ticksSimulated = 0; drive(&a0, lvp); long long tOff = lvp.ticksSimulated;
+        Analyzer a1(mp, on);  lvp.ticksSimulated = 0; drive(&a1, lvp); long long tOn = lvp.ticksSimulated;
+        CHECK(a0.unitSet().units.size() == 12);
+        bool same = true;
+        for (size_t i = 0; i < a0.report().groups.size(); ++i)
+            if (a0.report().groups[i].w.lo != a1.report().groups[i].w.lo || a0.report().groups[i].w.hi != a1.report().groups[i].w.hi) same = false;
+        CHECK(same && tOn * 3 < tOff && a1.report().cpOk > 0 && a1.report().cpFallbacks == 0);
+        std::printf("  click pairs: %d trials for %zu clicks, checkpoints: %lld vs %lld ticks\n", a0.report().totalTrials, a0.unitSet().units.size(), tOn, tOff);
+
+        Analyzer part(mp, off);
+        for (int i = 0; i < 30; ++i) { auto sp = part.nextTrial(); if (!sp) break; part.submit(runFake(lvp, *sp)); }
+        (void)part.nextTrial(); part.cancel("paused");
+        SavedResults saved = parseResultsCsv(formatCsv(part, 240));
+        CHECK(!saved.complete && saved.total == 12 && saved.done > 0 && saved.done < 12);
+        Analyzer res(mp, off); res.usePrior(saved.rows); drive(&res, lvp);
+        bool same2 = res.report().complete && res.report().resumed == saved.done;
+        for (size_t i = 0; i < a0.report().groups.size(); ++i)
+            if (a0.report().groups[i].w.lo != res.report().groups[i].w.lo || a0.report().groups[i].w.hi != res.report().groups[i].w.hi) same2 = false;
+        CHECK(same2);
+    }
+}
+
 static void testFastMode() {
     SECTION("fast mode (beta): extremes decide 10+, calibrated checkpoints skip the base test");
     std::vector<std::tuple<int, int, int>> ev;
@@ -678,7 +914,7 @@ static void testFastMode() {
         lv.rules[2 * i + 1] = {238 + i * 120, 243 + i * 120, 0};
     }
     MacroFile m = parseMacro(macroText(ev));
-    AnalyzerSettings normal; normal.skipFreeReleases = false;          // checkpoints + maxWidth 10 are the defaults
+    AnalyzerSettings normal; normal.pairClicks = false; normal.skipFreeReleases = false;          // checkpoints + maxWidth 10 are the defaults
     AnalyzerSettings fast = normal; fast.fastMode = true;
     Analyzer a0(m, normal); drive(&a0, lv);
     Analyzer a1(m, fast);   drive(&a1, lv);
@@ -749,6 +985,8 @@ static void testWrap() {
 }
 
 int main() {
+    testMakeMacro();
+    testPairs();
     testFastMode();
     testHorizonFreeResume();
     testCapAndCheckpoints();
