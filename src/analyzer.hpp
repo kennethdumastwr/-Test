@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "macro.hpp"
+#include "makemacro.hpp"
 #include "overlay.hpp"
 #include "window.hpp"
 
@@ -38,6 +39,7 @@ struct AnalyzerSettings {
     int horizonGroups = 1;      // survive until this many following inputs (same player) fired...
     int horizonMinTicks = 0;    // ...and at least this many ticks after the tested input
     int horizonMargin = 0;      // extra ticks survived after the following input fired
+    bool pairClicks = true;     // a click and its release are ONE unit and get the same offset in every trial
     bool skipFreeReleases = true;  // a release that survives -N and +N ticks is "free" and not analysed
     int freeReleaseTicks = 10;
     bool horizonToEnd = false;  // survive to the end of the reference run
@@ -89,6 +91,7 @@ struct GroupReport {
     GroupState state = GroupState::NotSelected;
     int refTick = -1;
     int endTick = -1;
+    int holdTicks = 0;            // click: ticks between the press and its release in the original macro
     bool horizonCapped = false;
     bool fastAssumed = false;     // fast mode: width assumed from the two extreme offsets
     bool usedCheckpoint = false;  // trials started from a checkpoint
@@ -131,16 +134,19 @@ class Analyzer {
 public:
     Analyzer(MacroFile macro, AnalyzerSettings s) : macro_(std::move(macro)), s_(s) {
         gs_ = buildGroups(macro_.actions, std::max(1e-6, s_.epsilon));
-        report_.groups.resize(gs_.groups.size());
-        for (size_t i = 0; i < gs_.groups.size(); ++i) {
-            const Group& g = gs_.groups[i];
+        us_ = buildUnits(gs_, macro_.actions, s_.pairClicks);
+        report_.groups.resize(us_.units.size());
+        for (size_t i = 0; i < us_.units.size(); ++i) {
+            const Unit& u = us_.units[i];
             GroupReport& r = report_.groups[i];
-            r.group = static_cast<int>(i);
-            r.player = g.player;
-            r.x = g.x;
-            r.kind = g.kind;
-            r.number = g.number;
-            r.actionCount = static_cast<int>(g.actions.size());
+            r.group = static_cast<int>(i);  // index of the UNIT
+            r.player = u.player;
+            r.x = u.x;
+            r.kind = u.kind == UnitKind::Single ? u.single : GroupKind::Press;
+            r.number = u.number;
+            int n = 0;
+            for (int gi : u.groups) n += static_cast<int>(gs_.groups[gi].actions.size());
+            r.actionCount = n;
         }
         refFire_.assign(gs_.groups.size(), -1);
     }
@@ -150,6 +156,40 @@ public:
 
     const Report& report() const { return report_; }
     const GroupSet& groups() const { return gs_; }
+    const UnitSet& unitSet() const { return us_; }
+
+    // The macro with every analysed click moved to a tick inside its measured window (see makemacro.hpp).
+    // Clicks without a trustworthy window (10+, unstable, drifted, not analysed) keep their recorded timing.
+    std::vector<MacroAction> pickedActions(PickMode mode) const {
+        std::vector<MacroAction> out = macro_.actions;
+        for (size_t ui = 0; ui < us_.units.size(); ++ui) {
+            const GroupReport& r = report_.groups[ui];
+            if (r.state != GroupState::Analyzed || r.w.baseFailed || r.w.capped || r.w.unstable || r.w.drift) continue;
+            const int d = pickOffset(r.w.lo, r.w.hi, mode);
+            if (d == 0) continue;
+            bool inRange = true;  // all-or-nothing: a click is never half moved
+            for (int gi : us_.units[ui].groups) {
+                const int t = refFire_[gi] + d;
+                if (t < 0 || t >= static_cast<int>(xs_.size())) inRange = false;
+            }
+            if (!inRange) continue;
+            for (int gi : us_.units[ui].groups)
+                for (int id : gs_.groups[gi].actions) out[id].x = xs_[refFire_[gi] + d];
+        }
+        std::stable_sort(out.begin(), out.end(), [](const MacroAction& a, const MacroAction& b) { return a.x < b.x; });
+        return out;
+    }
+
+    // x of every action id for original / center / earliest / latest (saved so a macro can be made later without analysing again)
+    std::vector<PickRow> pickTable() const {
+        std::vector<PickRow> rows(macro_.actions.size());
+        const PickMode modes[3] = {PickMode::Center, PickMode::Earliest, PickMode::Latest};
+        for (size_t i = 0; i < rows.size(); ++i) rows[i][0] = macro_.actions[i].x;
+        for (int k = 0; k < 3; ++k) {
+            for (const MacroAction& a : pickedActions(modes[k])) rows[a.id][k + 1] = a.x;
+        }
+        return rows;
+    }
     const MacroFile& macro() const { return macro_; }
     bool finished() const { return stage_ == Stage::Done; }
 
@@ -159,7 +199,7 @@ public:
         p.groupsDone = std::min<int>(nextSel_ - (cur_ ? 1 : 0), p.groupsTotal);
         p.trials = report_.totalTrials;
         if (cur_) {
-            p.currentNumber = gs_.groups[cur_->group].number;
+            p.currentNumber = us_.units[cur_->group].number;
             p.currentOffset = pendingOffset_;
         }
         return p;
@@ -315,7 +355,16 @@ private:
             : group(g), refTick(t), endTick(e), capped(c), cpAt(cp), usingCp(cp >= 0), cfg(config), search(config) {}
     };
 
-    bool isNoOp(int gi) const { return gs_.groups[gi].kind == GroupKind::NoOp; }
+    bool isNoOp(int ui) const { return us_.units[ui].kind == UnitKind::NoOp; }
+    int firstTick(int ui) const { return refFire_[us_.units[ui].groups.front()]; }
+    int lastTick(int ui) const { return refFire_[us_.units[ui].groups.back()]; }
+    bool reached(int ui) const {
+        for (int gi : us_.units[ui].groups) {
+            const int t = refFire_[gi];
+            if (t < 0 || (refDeath_ >= 0 && t >= refDeath_)) return false;
+        }
+        return true;
+    }
 
     void processReference(const TrialResult& r) {
         report_.referenceRan = true;
@@ -345,14 +394,15 @@ private:
             refFire_[gi] = (id < static_cast<int>(r.firedTick.size())) ? r.firedTick[id] : -1;
         }
 
-        // Which groups to analyse.
-        for (size_t gi = 0; gi < gs_.groups.size(); ++gi) {
+        // Which units to analyse.
+        for (size_t ui = 0; ui < us_.units.size(); ++ui) {
             bool pick = true;
             if (s_.onlyAction > 0) {
                 pick = false;
-                for (int id : gs_.groups[gi].actions) if (id + 1 == s_.onlyAction) pick = true;
+                for (int gi : us_.units[ui].groups)
+                    for (int id : gs_.groups[gi].actions) if (id + 1 == s_.onlyAction) pick = true;
             }
-            if (pick) selected_.push_back(static_cast<int>(gi));
+            if (pick) selected_.push_back(static_cast<int>(ui));
         }
         if (selected_.empty()) {
             report_.note = "action #" + std::to_string(s_.onlyAction) + " does not exist in this macro";
@@ -368,15 +418,15 @@ private:
         return xs_[t] - xs_[t - 1] > 2.0 * s_.epsilon;
     }
 
-    // Neighbour = previous/next group of the SAME player that actually changes state.
-    int neighbourTick(int gi, int dir) const {
-        const auto& list = gs_.byPlayer[gs_.groups[gi].player];
+    // Neighbour = previous/next UNIT of the SAME player that actually changes state.
+    // Previous: the tick its LAST input fired on. Next: the tick its FIRST input fired on.
+    int neighbourTick(int ui, int dir) const {
+        const auto& list = us_.byPlayer[us_.units[ui].player];
         int at = -1;
-        for (size_t i = 0; i < list.size(); ++i) if (list[i] == gi) at = static_cast<int>(i);
+        for (size_t i = 0; i < list.size(); ++i) if (list[i] == ui) at = static_cast<int>(i);
         for (int i = at + dir; i >= 0 && i < static_cast<int>(list.size()); i += dir) {
             if (isNoOp(list[i])) continue;
-            int t = refFire_[list[i]];
-            if (t >= 0 && (refDeath_ < 0 || t < refDeath_)) return t;
+            if (reached(list[i])) return dir < 0 ? lastTick(list[i]) : firstTick(list[i]);
             if (dir > 0) return -1;  // unreached: nothing to collide with
         }
         return -1;
@@ -391,7 +441,7 @@ private:
 
     // Take over a finished input of an interrupted analysis (same number AND same x).
     bool takePrior(int gi) {
-        const Group& g = gs_.groups[gi];
+        const Unit& g = us_.units[gi];
         for (const PriorRow& pr : prior_) {
             if (pr.number != g.number || std::fabs(pr.x - g.x) > 1e-3) continue;
             GroupReport& rep = report_.groups[gi];
@@ -424,7 +474,8 @@ private:
                 return false;
             }
             rep.y = pr.y;
-            rep.refTick = refFire_[gi];
+            rep.refTick = firstTick(gi);
+            rep.holdTicks = lastTick(gi) - firstTick(gi);
             ++report_.resumed;
             return true;
         }
@@ -435,9 +486,12 @@ private:
         GroupReport& rep = report_.groups[gi];
         if (isNoOp(gi)) { rep.state = GroupState::Redundant; return; }
         if (takePrior(gi)) return;
-        const int T = refFire_[gi];
-        rep.refTick = T;
-        if (T < 0 || (refDeath_ >= 0 && T >= refDeath_)) { rep.state = GroupState::Unreached; return; }
+        const Unit& unit = us_.units[gi];
+        if (!reached(gi)) { rep.state = GroupState::Unreached; rep.refTick = firstTick(gi); return; }
+        const int Tf = firstTick(gi);   // first input of the unit (the click)
+        const int Tl = lastTick(gi);    // last input of the unit (the release, or the last release of a chain)
+        rep.refTick = Tf;
+        rep.holdTicks = Tl - Tf;
 
         const int last = static_cast<int>(xs_.size()) - 1;  // last tick whose x is known
         const int R = std::max(1, s_.radius);
@@ -448,9 +502,10 @@ private:
         cfg.verify = s_.verify;
         cfg.maxWidth = s_.thorough ? 0 : std::max(0, s_.maxWidth);
 
-        // ---- range, clipped by neighbours / start / end of data
-        const int prevT = neighbourTick(gi, -1);
-        const int nextT = neighbourTick(gi, +1);
+        // ---- range: EVERY input of the unit moves by the same d, so the click must stay after the previous unit
+        // and the release before the next one
+        const int prevT = neighbourTick(gi, -1);  // tick the previous unit ended on
+        const int nextT = neighbourTick(gi, +1);  // tick the next unit starts on
         const int minTick = (prevT >= 0) ? prevT + 1 : 0;
         const Limit minReason = (prevT >= 0) ? Limit::Neighbor : Limit::Start;
         int maxTick = last;
@@ -458,52 +513,57 @@ private:
         if (nextT >= 0 && nextT - 1 < maxTick) { maxTick = nextT - 1; maxReason = Limit::Neighbor; }
 
         cfg.rangeLo = -R; cfg.limitLo = Limit::Radius;
-        if (minTick - T > -R) { cfg.rangeLo = minTick - T; cfg.limitLo = minReason; }
+        if (minTick - Tf > -R) { cfg.rangeLo = minTick - Tf; cfg.limitLo = minReason; }
         cfg.rangeHi = R; cfg.limitHi = Limit::Radius;
-        if (maxTick - T < R) { cfg.rangeHi = maxTick - T; cfg.limitHi = maxReason; }
+        if (maxTick - Tl < R) { cfg.rangeHi = maxTick - Tl; cfg.limitHi = maxReason; }
         cfg.rangeLo = std::min(cfg.rangeLo, 0);
         cfg.rangeHi = std::max(cfg.rangeHi, 0);
 
-        // ---- the position-based macro can only place an input on a tick if x grows every tick
+        // ---- the position-based macro can only place an input on a tick if x grows every tick (checked for every member)
         for (int d = 1; d <= cfg.rangeHi; ++d) {
-            if (!monotoneAt(T + d)) { cfg.rangeHi = d - 1; cfg.limitHi = Limit::Plateau; break; }
+            bool ok = true;
+            for (int g : unit.groups) ok = ok && monotoneAt(refFire_[g] + d);
+            if (!ok) { cfg.rangeHi = d - 1; cfg.limitHi = Limit::Plateau; break; }
         }
         for (int d = 0; d >= cfg.rangeLo; --d) {
-            if (!monotoneAt(T + d)) { cfg.rangeLo = d + 1; cfg.limitLo = Limit::Plateau; break; }
+            bool ok = true;
+            for (int g : unit.groups) ok = ok && monotoneAt(refFire_[g] + d);
+            if (!ok) { cfg.rangeLo = d + 1; cfg.limitLo = Limit::Plateau; break; }
         }
-        if (cfg.rangeLo > 0 || cfg.rangeHi < 0) {  // not even the original tick is unique
+        if (cfg.rangeLo > 0 || cfg.rangeHi < 0) {  // not even the original ticks are unique
             rep.state = GroupState::Unmappable;
             return;
         }
 
         // ---- end tick: identical for every offset, so results are comparable.
-        // Default: the next input of the ORIGINAL macro (a click must survive until its release, a release until the next click).
+        // Default: the next unit of the ORIGINAL macro: a click (press AND release) must survive until the next click.
         int end;
         bool capped = false;
         if (s_.horizonToEnd) {
             end = last;
         } else {
-            end = T + std::max(0, s_.horizonMinTicks);
-            const auto& list = gs_.byPlayer[gs_.groups[gi].player];
+            end = Tl + std::max(0, s_.horizonMinTicks);
+            const auto& list = us_.byPlayer[unit.player];
             int at = -1;
             for (size_t i = 0; i < list.size(); ++i) if (list[i] == gi) at = static_cast<int>(i);
             int seen = 0;
             for (int i = at + 1; i < static_cast<int>(list.size()) && seen < s_.horizonGroups; ++i) {
                 if (isNoOp(list[i])) continue;
                 ++seen;
-                int t = refFire_[list[i]];
+                const int t = firstTick(list[i]);
                 if (t < 0) break;
                 end = std::max(end, t + std::max(0, s_.horizonMargin));
             }
-            if (seen < s_.horizonGroups) end = std::max(end, T + kHorizonTail);  // fewer inputs left than asked for
+            if (seen < s_.horizonGroups) end = std::max(end, Tl + kHorizonTail);  // fewer units left than asked for
         }
+        end = std::max(end, Tl + cfg.rangeHi);  // the shifted release must have executed before the trial may end
         int cap = last;
         if (refDeath_ >= 0) cap = std::min(cap, refDeath_ - 1);
         if (end > cap) { end = cap; capped = true; }
-        if (end < T) { end = T; capped = true; }
+        if (end < Tl) { end = Tl; capped = true; }
 
         rep.state = GroupState::Analyzed;
-        rep.y = (T < static_cast<int>(ys_.size())) ? ys_[T] : 0.0;
+        rep.y = (Tf < static_cast<int>(ys_.size())) ? ys_[Tf] : 0.0;
         rep.endTick = end;
         rep.horizonCapped = capped;
         // The checkpoint taken at the previous input of the original macro, or the closest earlier one that exists.
@@ -514,8 +574,8 @@ private:
             auto it = cpAts_.upper_bound(prevT + 1);
             if (it != cpAts_.begin()) cpAt = *--it;
         }
-        cur_ = std::make_unique<Current>(gi, T, end, capped, cpAt, cfg);
-        if (s_.skipFreeReleases && gs_.groups[gi].kind == GroupKind::Release) {
+        cur_ = std::make_unique<Current>(gi, Tf, end, capped, cpAt, cfg);
+        if (s_.skipFreeReleases && unit.kind == UnitKind::Single && unit.single == GroupKind::Release) {
             const int n = std::max(1, s_.freeReleaseTicks);
             if (cfg.rangeHi >= n && cfg.rangeLo <= -n) cur_->freeOffsets = {n, -n};  // can only conclude if both are reachable
         }
@@ -544,12 +604,15 @@ private:
     }
 
     TrialSpec buildTrial(int off) const {
-        const Group& g = gs_.groups[cur_->group];
+        const Unit& u = us_.units[cur_->group];
         TrialSpec t;
         t.actions = macro_.actions;
         if (off != 0) {
-            const double x = xs_[cur_->refTick + off];
-            for (int id : g.actions) t.actions[id].x = x;
+            // every input of the unit moves by the SAME number of ticks: each goes to the x the player had at (its own tick + off)
+            for (int gi : u.groups) {
+                const double x = xs_[refFire_[gi] + off];
+                for (int id : gs_.groups[gi].actions) t.actions[id].x = x;
+            }
             std::stable_sort(t.actions.begin(), t.actions.end(),
                              [](const MacroAction& a, const MacroAction& b) { return a.x < b.x; });
         }
@@ -561,17 +624,21 @@ private:
     }
 
     Verdict classify(const TrialResult& r) const {
-        const Group& g = gs_.groups[cur_->group];
-        int pos = -1;
-        for (size_t i = 0; i < pendingSpec_->actions.size(); ++i) {
-            if (pendingSpec_->actions[i].id == g.actions[0]) { pos = static_cast<int>(i); break; }
-        }
-        const int expect = cur_->refTick + pendingOffset_;
-        const int fired = (pos >= 0 && pos < static_cast<int>(r.firedTick.size())) ? r.firedTick[pos] : -1;
+        const Unit& u = us_.units[cur_->group];
         const int end = cur_->endTick;
-
-        if (fired < 0) return r.died ? Verdict::Fail : Verdict::Invalid;
-        if (fired != expect) return Verdict::Invalid;  // x->tick mapping drifted (speed change, other path)
+        bool anyMissing = false, anyDrift = false;
+        for (int gi : u.groups) {
+            int pos = -1;
+            for (size_t i = 0; i < pendingSpec_->actions.size(); ++i) {
+                if (pendingSpec_->actions[i].id == gs_.groups[gi].actions[0]) { pos = static_cast<int>(i); break; }
+            }
+            const int expect = refFire_[gi] + pendingOffset_;
+            const int fired = (pos >= 0 && pos < static_cast<int>(r.firedTick.size())) ? r.firedTick[pos] : -1;
+            if (fired < 0) anyMissing = true;
+            else if (fired != expect) anyDrift = true;  // x->tick mapping drifted (speed change, other path)
+        }
+        if (anyMissing) return r.died ? Verdict::Fail : Verdict::Invalid;
+        if (anyDrift) return Verdict::Invalid;
         if (r.died && r.deathTick <= end) return Verdict::Fail;
         if (!r.completed && r.ticksRun <= end) return Verdict::Invalid;  // stopped before the end tick
         return Verdict::Pass;
@@ -580,6 +647,7 @@ private:
     MacroFile macro_;
     AnalyzerSettings s_;
     GroupSet gs_;
+    UnitSet us_;
     Report report_;
     Stage stage_ = Stage::NeedReference;
     std::vector<PriorRow> prior_;

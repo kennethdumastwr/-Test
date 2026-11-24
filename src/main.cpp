@@ -67,6 +67,16 @@ namespace {
         int ignoreEarlyTicks = 0;
         bool pendingRestart = false;  // after a cancel: restart the level once the player resumes (clears placed checkpoints)
         int budgetMs = 14;           // 'max CPU' mode: milliseconds of analysis per real frame
+        // What counts as ONE physics tick: every processCommands call, or only the ones that are not "half ticks".
+        // Measured, not assumed: counting the wrong ones makes every window 4x too small (it samples the macro at 60 Hz).
+        bool countHalf = false;
+        bool tickModeKnown = false;
+        bool calibrating = false;
+        bool needCalibration = false;
+        long long calAll = 0, calFull = 0;      // active calibration (before an analysis)
+        long long passAll = 0, passFull = 0;    // passive calibration (normal play, for playback)
+        double passSeconds = 0.0;
+        std::string tickNote;
         bool fast = false;           // fast mode (beta)
         bool hidden = false;         // level hidden while analysing (fast mode)
         int fireSeenTick = -1;       // last tick index in which inputs fired
@@ -160,6 +170,7 @@ namespace {
         s.freeReleaseTicks = static_cast<int>(mod->getSettingValue<int64_t>("free-release-ticks"));
         s.epsilon = mod->getSettingValue<double>("x-epsilon");
         s.onlyAction = static_cast<int>(mod->getSettingValue<int64_t>("only-action"));
+        s.pairClicks = mod->getSettingValue<bool>("pair-clicks");
         s.maxWidth = static_cast<int>(mod->getSettingValue<int64_t>("max-width"));
         s.useCheckpoints = mod->getSettingValue<bool>("use-checkpoints");
         const double tps = static_cast<double>(mod->getSettingValue<int64_t>("expected-tps"));
@@ -439,6 +450,30 @@ namespace {
 #endif
     }
 
+    fs::path picksCsv(const std::string& macro) { return resultsDir() / (fs::path(macro).stem().string() + ".windows.picks.csv"); }
+
+    // Make a NEW macro in the percent-macro folder: every analysed click moved to the center / earliest / latest tick of its window.
+    // Needs the saved pick table of a finished analysis of that macro. Never overwrites the original.
+    bool makeMacroFile(const std::string& macroName, fw::PickMode mode, std::string& outName, std::string& err) {
+        std::string raw, table;
+        if (!readFile(resolveMacrosDir() / macroName, raw)) { err = "cannot read " + macroName; return false; }
+        if (!readFile(picksCsv(macroName), table)) { err = "analyze " + macroName + " completely first (no pick table saved)"; return false; }
+        fw::MacroFile mf = fw::parseMacro(raw);
+        std::vector<fw::PickRow> rows;
+        std::vector<fw::MacroAction> acts;
+        if (!mf.ok() || !fw::parsePickTable(table, rows) || !fw::applyPicks(mf, rows, mode, acts)) {
+            err = macroName + " changed since it was analysed - analyze again";
+            return false;
+        }
+        const std::string stem = fs::path(macroName).stem().string();
+        outName = stem + "_" + fw::pickName(mode) + ".txt";
+        const std::string text = fw::formatMacroText(mf, acts, std::string("made by Percent Frame Window from ") + macroName + ": every click at the " + fw::pickName(mode) + " tick of its frame window");
+        std::ofstream f(resolveMacrosDir() / outName, std::ios::binary);
+        if (!f) { err = "cannot write " + outName + " to the percent-macro folder"; return false; }
+        f << text;
+        return true;
+    }
+
     void endSession(PlayLayer* pl, bool showReport, bool restartLevel) {
         g.phase = Phase::Idle;
         if (g.hidden) {
@@ -455,6 +490,7 @@ namespace {
                 const double observed = static_cast<double>(g.tickTotal) / g.simSeconds;
                 warn = "game ran at ~" + fw::fmt("%.0f", observed) + " ticks/s (expected " + fw::fmt("%.0f", g.expectedTps) + ")";
                 if (std::fabs(observed - g.expectedTps) > g.expectedTps * 0.02) warn = "WARNING: " + warn + ". Windows use the measured rate.";
+                if (!g.tickNote.empty()) warn += "; " + g.tickNote;
                 warn += "; checkpoint starts " + std::to_string(g.cpRestores) + (g.cpMissing ? ", not loadable " + std::to_string(g.cpMissing) : std::string());
                 tps = observed;
             }
@@ -481,6 +517,15 @@ namespace {
                     body += "\nSaved: " + (dir / (stem + ".windows.csv")).string();
                 }
                 ++g.overlayRevision;
+                if (g.analyzer->report().complete) {  // a finished analysis can produce a macro
+                    std::ofstream(picksCsv(g.macroName)) << fw::formatPickTable(g.analyzer->pickTable());
+                    if (Mod::get()->getSettingValue<bool>("auto-make-macro")) {
+                        std::string made, err;
+                        const fw::PickMode mode = fw::pickFromInt(static_cast<int>(Mod::get()->getSettingValue<int64_t>("macro-pick")));
+                        if (makeMacroFile(g.macroName, mode, made, err)) body += "\n<cg>New macro saved: " + made + " (percent-macro folder)</c>";
+                        else body += "\n<cr>Could not make a macro: " + err + "</c>";
+                    }
+                }
             }
             g.pendingTitle = "Frame Windows";
             g.pendingText = body;
@@ -607,6 +652,52 @@ namespace {
         return true;
     }
 
+    // Measure how many processCommands calls the game really makes per 1/60 s and count ticks the way that matches TPS.
+    void runCalibration(PlayLayer* pl) {
+        g.resettingByUs = true;
+        pl->resetLevelFromStart();
+        g.resettingByUs = false;
+        g.inFrame = true;
+        pl->update(1.f / 60.f);  // warm-up, not counted
+        g.calAll = g.calFull = 0;
+        g.calibrating = true;
+        for (int i = 0; i < 3; ++i) pl->update(1.f / 60.f);
+        g.calibrating = false;
+        g.inFrame = false;
+        const double expected = 3.0 * g.expectedTps / 60.0;
+        const double all = static_cast<double>(g.calAll), full = static_cast<double>(g.calFull);
+        g.countHalf = std::fabs(all / expected - 1.0) <= std::fabs(full / expected - 1.0);
+        g.tickModeKnown = true;
+        Mod::get()->setSavedValue<int>("fw-count-half", g.countHalf ? 1 : 0);
+        g.tickNote = std::string("tick = ") + (g.countHalf ? "every physics step" : "full ticks only (half ticks skipped)") + "; measured " +
+                     std::to_string(g.calAll) + " steps / " + std::to_string(g.calFull) + " full per " + fw::fmt("%.0f", expected) + " expected";
+    }
+
+    // Playback outside of an analysis: decide the same way, passively, from the first ~2 seconds of normal play.
+    void passiveTickMode(float dt) {
+        auto mod = Mod::get();
+        const int forced = static_cast<int>(mod->getSettingValue<int64_t>("tick-mode"));  // 0 auto, 1 every step, 2 full ticks only
+        if (forced == 1 || forced == 2) {
+            g.countHalf = forced == 1;
+            g.tickModeKnown = true;
+            return;
+        }
+        if (g.tickModeKnown) return;
+        const int saved = mod->getSavedValue<int>("fw-count-half", -1);
+        if (saved >= 0) {
+            g.countHalf = saved == 1;
+            g.tickModeKnown = true;
+            return;
+        }
+        g.passSeconds += std::clamp<double>(dt, 0.0, 0.1);
+        if (g.passSeconds < 2.0) return;
+        const double expected = g.passSeconds * static_cast<double>(mod->getSettingValue<int64_t>("expected-tps"));
+        const double all = static_cast<double>(g.passAll), full = static_cast<double>(g.passFull);
+        g.countHalf = std::fabs(all / expected - 1.0) <= std::fabs(full / expected - 1.0);
+        g.tickModeKnown = true;
+        mod->setSavedValue<int>("fw-count-half", g.countHalf ? 1 : 0);
+    }
+
     // How many physics ticks the next update() call should run.
     int chunkTicks() {
         if (g.spec.captureCheckpoints) return 1;  // reference run: stop at every tick so checkpoints sit exactly on a tick boundary
@@ -654,6 +745,7 @@ namespace {
         bool hasResults = false;  // current-format results with at least one click
         bool oldFormat = false;   // results from an older version (no y column)
         bool partial = false;     // an interrupted analysis that can be resumed
+        bool hasPicks = false;    // a finished analysis: a new macro can be made from it
         int done = 0, total = 0;
         bool canDelete() const { return hasResults || oldFormat; }
     };
@@ -680,6 +772,8 @@ namespace {
                 e.done = sr.done;
                 e.total = sr.total;
                 e.partial = !sr.complete && sr.done > 0;
+                std::error_code pe;
+                e.hasPicks = sr.complete && fs::exists(picksCsv(name), pe);
             }
             out.push_back(e);
         }
@@ -753,6 +847,15 @@ namespace {
             pl->setVisible(false);  // nothing to draw while analysing: more time for physics
             g.hidden = true;
         }
+        {
+            const int forced = static_cast<int>(mod->getSettingValue<int64_t>("tick-mode"));
+            g.needCalibration = forced == 0;  // auto: measure right before the reference run
+            if (forced != 0) {
+                g.countHalf = forced == 1;
+                g.tickModeKnown = true;
+                g.tickNote = std::string("tick = ") + (g.countHalf ? "every physics step" : "full ticks only") + " (set by hand)";
+            }
+        }
         g.phase = Phase::Running;  // the next update() starts the reference run
         pause->onResume(nullptr);
     }
@@ -765,7 +868,18 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
     // 2.2081 signature: (dt, isHalfTick, isLastTick). Half ticks are not physics ticks of the macro's 240 TPS,
     // so they pass straight through; if the report says the game ran at ~480 ticks/s, flip this condition.
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (isHalfTick || static_cast<GJBaseGameLayer*>(PlayLayer::get()) != this) {
+        if (static_cast<GJBaseGameLayer*>(PlayLayer::get()) != this) {
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            return;
+        }
+        if (g.calibrating) {
+            ++g.calAll;
+            if (!isHalfTick) ++g.calFull;
+        } else if (!g.tickModeKnown) {
+            ++g.passAll;
+            if (!isHalfTick) ++g.passFull;
+        }
+        if (isHalfTick && !g.countHalf) {  // only skipped when the measurement says half ticks are NOT physics ticks
             GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
@@ -831,6 +945,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             g.resettingByUs = false;
             releaseCheckpoints();  // the game just removed its checkpoints with the restart
         }
+        if (!g.inFrame && g.phase == Phase::Idle) passiveTickMode(dt);
         refreshOverlay(pl);
         updateOverlayProgress(pl);
         refreshPlayback(pl);
@@ -840,6 +955,10 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         }
 
         ensureLabel();
+        if (g.needCalibration) {
+            g.needCalibration = false;
+            runCalibration(pl);
+        }
         // Speed is "times real time", independent of the frame rate: tick budget per frame = speed * TPS * real frame time.
         // 0 = max: as many ticks as fit in the frame budget. Each update() call runs a chunk of ticks (see chunkTicks()).
         const double realDt = std::clamp<double>(dt, 0.001, 0.1);
@@ -1029,10 +1148,11 @@ class $modify(FWPause, PauseLayer) {
                              : e.oldFormat ? std::string("old results - Analyze again")
                                            : std::string("not analysed yet");
             label(st, "chatFont.fnt", 0.5f, -208.f, dy - 8.f, ccc3(170, 200, 255), true);
-            button(e.partial ? "Resume" : "Analyze", 0.4f, 8.f, dy, i, menu_selector(FWPause::onMenuAnalyze));
-            button("Show", 0.4f, 70.f, dy, i, menu_selector(FWPause::onMenuShow));
-            button("Play", 0.4f, 116.f, dy, i, menu_selector(FWPause::onMenuPlay));
-            if (e.canDelete()) button("Del", 0.4f, 160.f, dy, i, menu_selector(FWPause::onMenuDelete));
+            button(e.partial ? "Resume" : "Analyze", 0.4f, 6.f, dy, i, menu_selector(FWPause::onMenuAnalyze));
+            button("Show", 0.4f, 64.f, dy, i, menu_selector(FWPause::onMenuShow));
+            button("Play", 0.4f, 104.f, dy, i, menu_selector(FWPause::onMenuPlay));
+            if (e.hasPicks) button("Make", 0.4f, 146.f, dy, i, menu_selector(FWPause::onMenuMake));
+            if (e.canDelete()) button("Del", 0.4f, 188.f, dy, i, menu_selector(FWPause::onMenuDelete));
         }
 
         label("page " + std::to_string(mn.page + 1) + "/" + std::to_string(pages), "chatFont.fnt", 0.6f, 0.f, -70.f, ccc3(255, 255, 255), false);
@@ -1093,6 +1213,15 @@ class $modify(FWPause, PauseLayer) {
         fwBuildMenu();
     }
 
+    void onMenuMake(CCObject* sender) {
+        const int i = fwTag(sender);
+        if (i < 0 || i >= static_cast<int>(mn.entries.size())) return;
+        const fw::PickMode mode = fw::pickFromInt(static_cast<int>(Mod::get()->getSettingValue<int64_t>("macro-pick")));
+        std::string made, err;
+        if (makeMacroFile(mn.entries[i].name, mode, made, err)) toast("Saved macro " + made + " in the percent-macro folder");
+        else toast(err, NotificationIcon::Error);
+    }
+
     void onMenuShow(CCObject* sender) { fwSelect(fwTag(sender), 1); }
     void onMenuPlay(CCObject* sender) { fwSelect(fwTag(sender), 2); }
 
@@ -1107,6 +1236,7 @@ class $modify(FWPause, PauseLayer) {
                              const std::string stem = fs::path(name).stem().string();
                              fs::remove(resultsDir() / (stem + ".windows.csv"), ec);
                              fs::remove(resultsDir() / (stem + ".windows.txt"), ec);
+                             fs::remove(resultsDir() / (stem + ".windows.picks.csv"), ec);
                              if (Mod::get()->getSavedValue<std::string>("selected-macro", "") == name) setWindowsMode(0);
                              else ++g.overlayRevision;
                              mn.entries = loadMenuEntries();

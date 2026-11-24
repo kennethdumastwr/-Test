@@ -40,6 +40,7 @@ struct ReportStyle {
     bool tags = false;  // GD rich-text colour tags (<cg> <cr> <co>)
     double tps = 240.0;
     int wrap = 0;       // wrap lines at this many characters (0 = off)
+    double refFps = 60.0;  // also show every window in frames of this frame rate (0 = off)
 };
 
 // Append `text` as one or more lines; every line gets its own colour tag so wrapping never breaks a tag.
@@ -77,16 +78,17 @@ inline std::string flagsText(const GroupReport& g) {
     return s;
 }
 
-inline std::string numbersText(const Group& g) {
-    if (g.actions.size() == 1) return "#" + std::to_string(g.actions[0] + 1);
-    return "#" + std::to_string(g.actions.front() + 1) + "-" + std::to_string(g.actions.back() + 1);
+inline std::string numbersText(const Unit& u) {
+    if (u.number == u.lastNumber) return "#" + std::to_string(u.number);
+    return "#" + std::to_string(u.number) + "-" + std::to_string(u.lastNumber);
 }
 
 // Returns the text of one input's line and the colour tag to use (nullptr = none).
-inline std::string formatLine(const GroupSet& gs, const GroupReport& g, const ReportStyle& st, const char*& tag) {
-    const Group& grp = gs.groups[g.group];
+inline std::string formatLine(const Unit& unit, const GroupReport& g, const ReportStyle& st, const char*& tag) {
     tag = nullptr;
-    std::string head = numbersText(grp) + (grp.player ? " P2 " : " ") + kindName(g.kind) + " x=" + fmt("%.3f", g.x);
+    std::string head = numbersText(unit) + (unit.player ? " P2 " : " ") + unitKindName(unit) +
+                       (unit.kind == UnitKind::Click && g.state == GroupState::Analyzed ? " (hold " + std::to_string(g.holdTicks) + "t)" : "") +
+                       " x=" + fmt("%.3f", g.x);
     switch (g.state) {
         case GroupState::NotSelected: return head + "  (not selected)";
         case GroupState::Redundant: return head + "  no state change - skipped";
@@ -97,7 +99,9 @@ inline std::string formatLine(const GroupSet& gs, const GroupReport& g, const Re
     }
     if (g.w.baseFailed) { tag = "cr"; return head + "  original timing does not pass"; }
     const double ms = g.w.width() * 1000.0 / st.tps;
-    std::string line = head + "  " + windowText(g.w) + " " + fmt("%.1f", ms) + (g.w.capped ? "ms+  " : "ms  ") + flagsText(g);
+    std::string fpsEq;
+    if (st.refFps > 0.0 && !g.w.capped) fpsEq = " =" + fmt("%.2f", g.w.width() * st.refFps / st.tps) + "F@" + fmt("%.0f", st.refFps);
+    std::string line = head + "  " + windowText(g.w) + fpsEq + " " + fmt("%.1f", ms) + (g.w.capped ? "ms+  " : "ms  ") + flagsText(g);
     const bool clean = !g.w.unstable && !g.w.drift && !g.w.island && g.w.clipLo == Limit::None && (g.w.clipHi == Limit::None || g.w.capped);
     tag = clean ? "cg" : ((g.w.unstable || g.w.drift) ? "cr" : "co");
     return line;
@@ -109,7 +113,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
     std::string out;
     addLine(out, st, nullptr, "Frame windows @" + fmt("%.0f", st.tps) + " TPS (1F = " + fmt("%.2f", 1000.0 / st.tps) + "ms)");
     addLine(out, st, nullptr, "macro: " + macroName + (m.levelName.empty() ? "" : "  level: " + m.levelName));
-    addLine(out, st, nullptr, "actions: " + std::to_string(m.actions.size()) + "  inputs: " + std::to_string(a.groups().groups.size()) +
+    addLine(out, st, nullptr, "actions: " + std::to_string(m.actions.size()) + "  clicks/units: " + std::to_string(a.unitSet().units.size()) +
                                   "  trials: " + std::to_string(r.totalTrials));
     if (r.cancelled) addLine(out, st, "cr", "CANCELLED: " + r.cancelReason + ". Partial results are saved: press Resume in the menu to continue.");
     if (!r.note.empty()) addLine(out, st, "cr", r.note);
@@ -158,7 +162,7 @@ inline std::string formatReport(const Analyzer& a, const ReportStyle& st, const 
     for (const GroupReport& g : r.groups) {
         if (g.state == GroupState::NotSelected) continue;
         const char* tag = nullptr;
-        std::string line = formatLine(a.groups(), g, st, tag);
+        std::string line = formatLine(a.unitSet().units[g.group], g, st, tag);
         addLine(out, st, tag, line);
     }
     return out;
@@ -171,16 +175,16 @@ inline std::string formatCsv(const Analyzer& a, double tps) {
     if (!a.macro().levelName.empty()) out += "# level " + a.macro().levelName + "\n";
     {
         int total = 0;
-        for (const Group& g : a.groups().groups) total += g.kind != GroupKind::NoOp;
+        for (const Unit& u : a.unitSet().units) total += u.kind != UnitKind::NoOp;
         out += std::string("# complete ") + (a.report().complete ? "1" : "0") + "\n# total " + std::to_string(total) + "\n";
     }
     out += "numbers,player,kind,x,y,state,lo,hi,width_ticks,width_ms,clip_lo,clip_hi,flags,trials\n";
     for (const GroupReport& g : a.report().groups) {
         if (g.state == GroupState::NotSelected) continue;
-        const Group& grp = a.groups().groups[g.group];
+        const Unit& grp = a.unitSet().units[g.group];
         const char* st = g.state == GroupState::Analyzed ? "analyzed" : g.state == GroupState::Redundant ? "no-op"
                          : g.state == GroupState::Free ? "free" : g.state == GroupState::Unreached ? "unreached" : "unmappable";
-        out += numbersText(grp).substr(1) + "," + (grp.player ? "P2" : "P1") + "," + kindName(g.kind) + "," + fmt("%.6f", g.x) + "," + fmt("%.3f", g.y) + "," + st + ",";
+        out += numbersText(grp).substr(1) + "," + (grp.player ? "P2" : "P1") + "," + unitKindName(grp) + "," + fmt("%.6f", g.x) + "," + fmt("%.3f", g.y) + "," + st + ",";
         if (g.state == GroupState::Analyzed && !g.w.baseFailed) {
             out += std::to_string(g.w.lo) + "," + std::to_string(g.w.hi) + "," + std::to_string(g.w.width()) + "," +
                    fmt("%.2f", g.w.width() * 1000.0 / tps) + "," + limitCsv(g.w.clipLo) + "," + limitCsv(g.w.clipHi) + "," +

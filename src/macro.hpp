@@ -275,3 +275,99 @@ inline GroupSet buildGroups(const std::vector<MacroAction>& acts, double eps = 1
 }
 
 }  // namespace fw
+
+// ---------------------------------------------------------------------------
+// Units: what the analyzer shifts as ONE thing.
+//   Click  = a press and its release (same offset for both in every trial)
+//   Chain  = clicks joined by taps (release + press at one x): all shifted together
+//   Hold   = a press the macro never releases
+//   Single = one same-x group on its own (the old per-input method, setting off)
+//   NoOp   = a group that changes nothing (listed, never analysed)
+// ---------------------------------------------------------------------------
+
+namespace fw {
+
+enum class UnitKind { NoOp, Single, Click, Chain, Hold };
+
+struct Unit {
+    int player = 0;
+    UnitKind kind = UnitKind::NoOp;
+    GroupKind single = GroupKind::NoOp;  // kind of the group when kind == Single
+    std::vector<int> groups;             // indices into GroupSet::groups, in order
+    int number = 0, lastNumber = 0;      // 1-based number of the first / last action
+    double x = 0.0;                      // x of the first group (where the click starts)
+    int clicks = 0;                      // press->release intervals inside
+};
+
+struct UnitSet {
+    std::vector<Unit> units;      // ordered by their first group
+    std::vector<int> byPlayer[2]; // indices into `units`
+};
+
+inline std::string unitKindName(const Unit& u) {
+    switch (u.kind) {
+        case UnitKind::NoOp: return "no-op";
+        case UnitKind::Single: return kindName(u.single);
+        case UnitKind::Click: return "click";
+        case UnitKind::Chain: return "chain(" + std::to_string(u.clicks) + ")";
+        case UnitKind::Hold: return "hold";
+    }
+    return "?";
+}
+
+inline UnitSet buildUnits(const GroupSet& gs, const std::vector<MacroAction>& acts, bool pairClicks) {
+    UnitSet us;
+    int open[2] = {-1, -1};  // index of the unit whose button is still held, per player
+    for (size_t gi = 0; gi < gs.groups.size(); ++gi) {
+        const Group& g = gs.groups[gi];
+        const int p = g.player;
+        std::vector<bool> eff;  // direction of every input that changes state
+        for (size_t i = 0; i < g.actions.size(); ++i) if (!g.redundant[i]) eff.push_back(acts[g.actions[i]].down);
+
+        if (g.kind == GroupKind::NoOp || eff.empty()) {
+            Unit u; u.player = p; u.kind = UnitKind::NoOp; u.groups = {static_cast<int>(gi)};
+            us.units.push_back(u);
+            continue;
+        }
+        if (!pairClicks) {
+            Unit u; u.player = p; u.kind = UnitKind::Single; u.single = g.kind; u.groups = {static_cast<int>(gi)};
+            for (bool d : eff) u.clicks += d;
+            us.units.push_back(u);
+            continue;
+        }
+
+        int ui = open[p];
+        if (ui < 0) {
+            if (!eff.front()) {  // a release with nothing held cannot happen (it would be redundant); keep it on its own
+                Unit u; u.player = p; u.kind = UnitKind::Single; u.single = g.kind; u.groups = {static_cast<int>(gi)};
+                us.units.push_back(u);
+                continue;
+            }
+            Unit u; u.player = p; u.kind = UnitKind::Click;
+            us.units.push_back(u);
+            ui = static_cast<int>(us.units.size()) - 1;
+        }
+        Unit& u = us.units[ui];
+        u.groups.push_back(static_cast<int>(gi));
+        for (bool d : eff) u.clicks += d;
+        open[p] = eff.back() ? ui : -1;  // still held after this group?
+    }
+    for (Unit& u : us.units) {
+        if (u.kind == UnitKind::Click || u.kind == UnitKind::Chain) {
+            const Group& last = gs.groups[u.groups.back()];
+            bool heldAtEnd = false;
+            for (size_t i = 0; i < last.actions.size(); ++i) if (!last.redundant[i]) heldAtEnd = acts[last.actions[i]].down;
+            if (heldAtEnd) u.kind = UnitKind::Hold;
+            else u.kind = (u.clicks > 1) ? UnitKind::Chain : UnitKind::Click;
+        }
+        const Group& first = gs.groups[u.groups.front()];
+        const Group& lastG = gs.groups[u.groups.back()];
+        u.number = first.number;
+        u.lastNumber = lastG.actions.back() + 1;
+        u.x = first.x;
+    }
+    for (size_t i = 0; i < us.units.size(); ++i) us.byPlayer[us.units[i].player].push_back(static_cast<int>(i));
+    return us;
+}
+
+}  // namespace fw
